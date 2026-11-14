@@ -46,7 +46,12 @@ pub struct Config {
     /// Capture the mouse: pane-limited text selection, click to focus and
     /// wheel scrolling.  Turn it off to get the terminal's own selection back.
     pub mouse: bool,
-    /// Prefix key for two-key shortcuts (tmux style), e.g. `ctrl+b`.
+    /// Play the banner animation when the Esc menu opens.
+    pub banner_animation: bool,
+    /// Show the repository's GitHub star count in the Esc menu.  This is the
+    /// only network request runetui makes; turn it off to stay fully offline.
+    pub show_stars: bool,
+    /// Prefix key for two-key shortcuts (tmux style), e.g. `ctrl+r`.
     pub prefix: String,
     /// Shortcut bindings, one entry per action (see `keymap`).  Keep this the
     /// last field so TOML writes it as a table at the end of the file.
@@ -67,6 +72,8 @@ impl Default for Config {
             show_terminal: true,
             terminal_height: DEFAULT_TERMINAL_PCT,
             mouse: true,
+            banner_animation: true,
+            show_stars: true,
             prefix: keymap::DEFAULT_PREFIX.to_string(),
             keys: keymap::default_specs(),
         }

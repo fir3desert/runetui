@@ -21,7 +21,8 @@ use crate::config::{self, Config};
 use crate::editor::{EmbeddedEditor, PtyPane};
 use crate::filesystem::Explorer;
 use crate::filesystem::watcher::FileWatcher;
-use crate::keymap::{Action, Chord, Keymap, Resolution};
+use crate::keymap::{Action, Chord, DEFAULT_PREFIX, Keymap, Resolution};
+use crate::stars::Stars;
 use crate::markdown::LinkKind;
 use crate::markdown::code_highlighter::CodeHighlighter;
 use crate::markdown::toc;
@@ -97,6 +98,8 @@ pub enum OptionItem {
     ShowTerminal,
     Mouse,
     Keys,
+    Animation,
+    GithubStars,
     ShowHidden,
     Gitignore,
     ExplorerWidth,
@@ -128,6 +131,8 @@ pub const OPTION_TABS: [OptionTab; 4] = [
             OptionItem::ShowTerminal,
             OptionItem::Mouse,
             OptionItem::Keys,
+            OptionItem::Animation,
+            OptionItem::GithubStars,
         ],
     },
     OptionTab {
@@ -202,6 +207,10 @@ pub struct App {
     pub adjusting: bool,
     /// Text selection confined to one pane.
     pub selection: Option<Selection>,
+    /// Options → Key bindings: the next key press becomes the prefix.
+    pub capturing_prefix: bool,
+    /// GitHub star count shown in the Esc menu.
+    pub stars: Stars,
 
     selection_copied: bool,
     clipboard: Option<String>,
@@ -260,6 +269,8 @@ impl App {
             pending: None,
             adjusting: false,
             selection: None,
+            capturing_prefix: false,
+            stars: Stars::start(config.show_stars),
             selection_copied: false,
             clipboard: None,
             term_failed: false,
@@ -343,6 +354,30 @@ impl App {
             let theme = self.theme();
             self.viewer.rerender(width, theme, &mut self.highlighter);
         }
+    }
+
+    /// Highlight the next chunk of a long source file when the reader is close
+    /// to the end of what has been highlighted so far.
+    pub fn fill_viewer(&mut self) {
+        if self.viewer.needs_more() {
+            let theme = self.theme();
+            self.viewer.load_more(theme, &mut self.highlighter);
+        }
+    }
+
+    /// Highlight the whole document (search, jump to the end).
+    fn load_all_viewer(&mut self) {
+        if self.viewer.is_partial() {
+            let theme = self.theme();
+            self.viewer.load_all(theme, &mut self.highlighter);
+        }
+    }
+
+    /// Move the viewer cursor to a rendered row, loading what is needed to get there.
+    fn jump_viewer_to(&mut self, line: usize) {
+        let theme = self.theme();
+        self.viewer.load_through(line, theme, &mut self.highlighter);
+        self.viewer.jump_to_line(line);
     }
 
     pub fn show_welcome(&mut self) {
@@ -456,8 +491,9 @@ impl App {
                     &mut self.highlighter,
                     None,
                 );
-                self.viewer.jump_to_line(cursor);
+                self.jump_viewer_to(cursor);
                 if let Some(query) = query {
+                    self.load_all_viewer();
                     self.viewer.apply_search(&query);
                 }
                 self.set_status("Document reloaded");
@@ -496,6 +532,8 @@ impl App {
     /// Called on every loop iteration.  Drains filesystem events, debounces
     /// refreshes, and expires transient messages.
     pub fn tick(&mut self) {
+        self.fill_viewer();
+        self.stars.poll();
         self.poll_editor();
         self.poll_term();
         if self
@@ -561,7 +599,7 @@ impl App {
     /// running.  `None` once it has finished, or when the menu was reached by
     /// going back from another screen: then the banner is static.
     pub fn menu_animation(&self) -> Option<Duration> {
-        if !matches!(self.overlay, Overlay::Menu { .. }) {
+        if !matches!(self.overlay, Overlay::Menu { .. }) || !self.config.banner_animation {
             return None;
         }
         self.menu_opened
@@ -588,6 +626,7 @@ impl App {
     /// Leave the current overlay, going back to the one that opened it.
     fn close_overlay(&mut self) {
         self.adjusting = false;
+        self.capturing_prefix = false;
         self.overlay = self.overlay_stack.pop().unwrap_or(Overlay::None);
     }
 
@@ -716,6 +755,41 @@ impl App {
         }
     }
 
+    /// Emergency exit: kill the focused editor or terminal without waiting
+    /// for it to cooperate.  Works while the pane owns the keyboard because
+    /// the prefix is always intercepted, and also when a pane is hidden or
+    /// unfocused: the editor goes first, then the shell.
+    pub fn force_close(&mut self) {
+        let terminal_first = self.focus == Focus::Terminal && self.term.is_some();
+        if !terminal_first {
+            if let Some(mut editor) = self.editor.take() {
+                editor.kill();
+                let path = editor.path.clone();
+                drop(editor);
+                self.after_editor(&path);
+                if self.focus == Focus::Terminal && self.term.is_none() {
+                    self.focus = Focus::Viewer;
+                }
+                self.set_terminal_area(self.area);
+                self.set_status("Editor killed (unsaved changes are lost)");
+                return;
+            }
+        }
+        if let Some(mut term) = self.term.take() {
+            term.kill();
+            drop(term);
+            self.show_term = false;
+            self.config.show_terminal = false;
+            if self.focus == Focus::Terminal {
+                self.focus = Focus::Viewer;
+            }
+            self.set_terminal_area(self.area);
+            self.set_status("Terminal killed");
+            return;
+        }
+        self.set_status("Nothing to kill: no editor or terminal is running");
+    }
+
     /// Close the panel when the shell exits (`exit`, Ctrl+D...).
     fn poll_term(&mut self) {
         let Some(term) = &mut self.term else {
@@ -785,7 +859,7 @@ impl App {
 
     fn restore_history(&mut self, entry: HistoryEntry) {
         self.open_file(entry.path, None, false);
-        self.viewer.jump_to_line(entry.cursor);
+        self.jump_viewer_to(entry.cursor);
         self.focus = Focus::Viewer;
     }
 
@@ -977,6 +1051,11 @@ impl App {
         // Typing ends a text selection.
         self.selection = None;
 
+        if self.capturing_prefix {
+            self.handle_prefix_capture(key);
+            return;
+        }
+
         if self.search_input.is_some() {
             self.handle_search_key(key);
             return;
@@ -1111,6 +1190,7 @@ impl App {
             Action::ExplorerGrow => self.resize_explorer(EXPLORER_STEP),
             Action::TerminalGrow => self.resize_terminal(TERMINAL_STEP),
             Action::TerminalShrink => self.resize_terminal(-TERMINAL_STEP),
+            Action::ForceClose => self.force_close(),
         }
     }
 
@@ -1310,6 +1390,8 @@ impl App {
                     self.set_status("Search cleared");
                     return;
                 }
+                // A search covers the whole file, not just what is highlighted.
+                self.load_all_viewer();
                 let count = self.viewer.apply_search(query.trim());
                 if count == 0 {
                     self.set_status(format!("No matches for “{}”", query.trim()));
@@ -1508,6 +1590,43 @@ impl App {
         self.overlay = Overlay::Options { tab, selected };
     }
 
+    /// While Options → Key bindings waits for a key: the pressed key becomes
+    /// the prefix, Backspace restores the default and Esc cancels.
+    fn handle_prefix_capture(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.capturing_prefix = false;
+                self.set_status("Prefix unchanged");
+            }
+            KeyCode::Backspace => {
+                self.capturing_prefix = false;
+                self.apply_prefix(DEFAULT_PREFIX.to_string());
+            }
+            _ => {
+                let chord = Chord::from_event(&key);
+                match self.keymap.check_prefix(chord) {
+                    Ok(()) => {
+                        self.capturing_prefix = false;
+                        self.apply_prefix(chord.spec());
+                    }
+                    // Stay in capture mode so another key can be tried.
+                    Err(reason) => self.set_status(format!("{reason} · try another key, Esc cancels")),
+                }
+            }
+        }
+    }
+
+    /// Make `spec` (e.g. `ctrl+a`) the prefix and save it in `config.toml`.
+    fn apply_prefix(&mut self, spec: String) {
+        self.config.prefix = spec;
+        self.keymap = Keymap::from_config(&self.config.prefix, &self.config.keys);
+        self.pending = None;
+        // Tests must not write the real configuration file.
+        #[cfg(not(test))]
+        let _ = self.config.save();
+        self.set_status(format!("Prefix is now {}", self.keymap.prefix_label()));
+    }
+
     fn activate_option(&mut self, item: OptionItem) {
         match item {
             OptionItem::Theme => self.open_theme_menu(),
@@ -1530,10 +1649,29 @@ impl App {
                 });
             }
             OptionItem::Keys => {
-                let place = Config::path()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "config.toml".to_string());
-                self.set_status(format!("Edit the [keys] table in {place}"));
+                self.capturing_prefix = true;
+                self.set_status(format!(
+                    "Press the new prefix key (now {}) · Backspace restores {} · Esc cancels",
+                    self.keymap.prefix_label(),
+                    Chord::parse(DEFAULT_PREFIX).map_or_else(|_| DEFAULT_PREFIX.to_string(), |chord| chord.label())
+                ));
+            }
+            OptionItem::Animation => {
+                self.config.banner_animation = !self.config.banner_animation;
+                self.set_status(if self.config.banner_animation {
+                    "Banner animation on"
+                } else {
+                    "Banner animation off: the menu opens with a static banner"
+                });
+            }
+            OptionItem::GithubStars => {
+                self.config.show_stars = !self.config.show_stars;
+                self.stars.set_enabled(self.config.show_stars);
+                self.set_status(if self.config.show_stars {
+                    "GitHub stars on: the count is fetched once an hour with curl"
+                } else {
+                    "GitHub stars off: runetui makes no network requests"
+                });
             }
             OptionItem::TerminalShell => {
                 self.set_status("Set $SHELL to change the shell");
@@ -1675,7 +1813,10 @@ impl App {
                 self.explorer.go_bottom();
                 self.preview_selection();
             }
-            Focus::Viewer => self.viewer.go_bottom(),
+            Focus::Viewer => {
+                self.load_all_viewer();
+                self.viewer.go_bottom();
+            }
             Focus::Terminal => {}
         }
     }
@@ -2378,6 +2519,94 @@ mod tests {
         false
     }
 
+    /// A program that ignores the polite ways of stopping it.
+    const HUNG: &str = "trap '' HUP INT TERM QUIT; while :; do read -r _; done";
+
+    #[test]
+    fn force_close_kills_a_hung_embedded_editor() {
+        let dir = project();
+        let mut app = app(&dir);
+        let file = dir.path().join("plain.txt");
+        let args = vec!["-c".to_string(), HUNG.to_string()];
+        let Ok(editor) = EmbeddedEditor::spawn_with("sh", &args, &file, 10, 40) else {
+            return; // no pty in this environment
+        };
+        app.editor = Some(editor);
+        app.focus = Focus::Viewer;
+
+        // Esc, q and Ctrl+C all go to the hung editor, which ignores them.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('q'));
+        press_ctrl(&mut app, 'c');
+        assert!(app.editor.is_some() && !app.should_quit);
+
+        prefix_then(&mut app, KeyCode::Char('x'));
+        assert!(app.editor.is_none(), "the prefix still reaches the app");
+        assert!(!app.should_quit);
+        assert!(app.status_text().is_some_and(|text| text.starts_with("Editor killed")));
+        assert!(!app.pane_captured(), "the keyboard is back");
+    }
+
+    #[test]
+    fn force_close_kills_a_hung_terminal_and_hides_the_panel() {
+        let dir = project();
+        let Some(mut app) = shell_app(&dir, HUNG) else {
+            return; // no pty in this environment
+        };
+        app.show_term = true;
+        press_ctrl(&mut app, 'c');
+        assert!(app.term.is_some(), "Ctrl+C goes to the shell, which ignores it");
+
+        prefix_then(&mut app, KeyCode::Char('x'));
+        assert!(app.term.is_none());
+        assert!(!app.show_term);
+        assert_eq!(app.focus, Focus::Viewer);
+        assert!(app.status_text().is_some_and(|text| text.starts_with("Terminal killed")));
+    }
+
+    #[test]
+    fn force_close_reaches_a_hidden_unfocused_shell() {
+        let dir = project();
+        let Some(mut app) = shell_app(&dir, HUNG) else {
+            return;
+        };
+        app.show_term = false;
+        app.focus = Focus::Viewer;
+        assert!(!app.pane_captured());
+        prefix_then(&mut app, KeyCode::Char('x'));
+        assert!(app.term.is_none(), "a hidden shell is killed too");
+    }
+
+    #[test]
+    fn force_close_with_nothing_running_only_says_so() {
+        let dir = project();
+        let mut app = app(&dir);
+        prefix_then(&mut app, KeyCode::Char('x'));
+        assert!(app.status_text().is_some_and(|text| text.starts_with("Nothing to kill")));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn force_close_kills_only_the_focused_pane_first() {
+        let dir = project();
+        let Some(mut app) = shell_app(&dir, HUNG) else {
+            return;
+        };
+        let file = dir.path().join("plain.txt");
+        let args = vec!["-c".to_string(), HUNG.to_string()];
+        let Ok(editor) = EmbeddedEditor::spawn_with("sh", &args, &file, 10, 40) else {
+            return;
+        };
+        app.editor = Some(editor);
+        app.show_term = true;
+        app.focus = Focus::Terminal;
+
+        prefix_then(&mut app, KeyCode::Char('x'));
+        assert!(app.term.is_none() && app.editor.is_some(), "the focused terminal goes first");
+        prefix_then(&mut app, KeyCode::Char('x'));
+        assert!(app.editor.is_none(), "a second press kills the editor");
+    }
+
     #[test]
     fn prefix_then_arrows_resize_the_left_and_bottom_panels() {
         let dir = project();
@@ -2506,9 +2735,11 @@ mod tests {
     #[test]
     fn prefix_twice_sends_the_prefix_key_to_the_shell() {
         let dir = project();
-        let Some(mut app) = shell_app(&dir, "stty -iexten; read -r line; printf '%s' \"$line\" | od -An -tx1") else {
+        let Some(mut app) = shell_app(&dir, "stty -iexten; echo ready; read -r line; printf '%s' \"$line\" | od -An -tx1") else {
             return;
         };
+        // Wait until `stty` has run: before that the tty still eats Ctrl+R.
+        assert!(wait_for_screen(&app, "ready"), "the shell is ready");
         press_ctrl(&mut app, 'r');
         press_ctrl(&mut app, 'r');
         press(&mut app, KeyCode::Enter);
@@ -2762,5 +2993,219 @@ mod tests {
         assert!(app.status_text().unwrap().contains("help"));
         press(&mut app, KeyCode::Char('?'));
         assert!(matches!(app.overlay, Overlay::Help { .. }));
+    }
+
+    // --------------------------------------------------- key binding capture
+
+    fn open_key_bindings(app: &mut App) {
+        let tab = OPTION_TABS[0]
+            .items
+            .iter()
+            .position(|item| *item == OptionItem::Keys)
+            .unwrap();
+        app.overlay = Overlay::Options { tab: 0, selected: tab };
+        press(app, KeyCode::Enter);
+    }
+
+    #[test]
+    fn enter_on_key_bindings_waits_for_the_new_prefix() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_key_bindings(&mut app);
+        assert!(app.capturing_prefix);
+        let status = app.status.as_ref().unwrap().text.clone();
+        assert!(status.contains("Press the new prefix key"), "{status}");
+        assert!(!status.contains("config.toml"), "no longer just shows the path");
+        // The options screen is still open behind the capture.
+        assert!(matches!(app.overlay, Overlay::Options { .. }));
+    }
+
+    #[test]
+    fn the_pressed_key_becomes_the_prefix() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_key_bindings(&mut app);
+        press_ctrl(&mut app, 'a');
+        assert!(!app.capturing_prefix);
+        assert_eq!(app.config.prefix, "ctrl+a");
+        assert_eq!(app.keymap.prefix_label(), "Ctrl+A");
+        assert!(app.status.as_ref().unwrap().text.contains("Ctrl+A"));
+        // Back in the interface the new prefix works and the old one does not.
+        app.overlay = Overlay::None;
+        press_ctrl(&mut app, 'a');
+        assert!(app.pending.is_some());
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.pending.is_none());
+        press_ctrl(&mut app, 'r');
+        assert!(app.pending.is_none(), "Ctrl+R is a plain key again");
+        // Shortcuts written as "prefix <key>" follow the new prefix.
+        let explorer = app.explorer.width_pct();
+        press_ctrl(&mut app, 'a');
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.explorer.width_pct(), explorer - 2);
+    }
+
+    #[test]
+    fn unusable_keys_are_refused_and_capture_continues() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_key_bindings(&mut app);
+        for key in [
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            app.handle_key(key);
+            assert!(app.capturing_prefix, "{key:?} must not end the capture");
+            assert_eq!(app.config.prefix, "ctrl+r");
+        }
+        assert!(!app.should_quit, "q and Ctrl+C did not reach the shortcuts");
+        assert!(app.status.as_ref().unwrap().text.contains("already used"));
+        // A valid key still works afterwards.
+        app.handle_key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE));
+        assert!(!app.capturing_prefix);
+        assert_eq!(app.config.prefix, "f9");
+    }
+
+    #[test]
+    fn backspace_restores_the_default_and_esc_cancels() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_key_bindings(&mut app);
+        press_ctrl(&mut app, 'a');
+        open_key_bindings(&mut app);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.capturing_prefix);
+        assert_eq!(app.config.prefix, "ctrl+a", "Esc leaves it as it was");
+        assert!(matches!(app.overlay, Overlay::Options { .. }), "Esc only cancels the capture");
+        open_key_bindings(&mut app);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.config.prefix, "ctrl+r");
+        assert_eq!(app.keymap.prefix_label(), "Ctrl+R");
+    }
+
+    #[test]
+    fn the_new_prefix_survives_a_config_round_trip() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_key_bindings(&mut app);
+        press_ctrl(&mut app, 'a');
+        let file = dir.path().join("config.toml");
+        app.config.save_to(&file).unwrap();
+        let loaded = Config::load_from(&file).unwrap();
+        assert_eq!(loaded.prefix, "ctrl+a");
+        assert_eq!(Keymap::from_config(&loaded.prefix, &loaded.keys).prefix_label(), "Ctrl+A");
+    }
+
+    // ------------------------------------------------- animation and stars
+
+    #[test]
+    fn the_banner_animation_can_be_switched_off() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.open_menu();
+        assert!(app.menu_animation().is_some());
+        app.close_overlay();
+        app.config.banner_animation = false;
+        app.open_menu();
+        assert!(app.menu_animation().is_none(), "the menu opens with a static banner");
+    }
+
+    #[test]
+    fn options_toggle_the_animation_and_the_stars() {
+        let dir = project();
+        let mut app = app(&dir);
+        let position = |wanted: OptionItem| {
+            OPTION_TABS[0].items.iter().position(|item| *item == wanted).unwrap()
+        };
+        app.overlay = Overlay::Options { tab: 0, selected: position(OptionItem::Animation) };
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.config.banner_animation);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.config.banner_animation);
+
+        app.overlay = Overlay::Options { tab: 0, selected: position(OptionItem::GithubStars) };
+        assert!(app.config.show_stars);
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.config.show_stars);
+        assert_eq!(app.stars.state(), crate::stars::StarsState::Off);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.config.show_stars);
+        assert_ne!(app.stars.state(), crate::stars::StarsState::Off);
+    }
+
+    // ------------------------------------------------ long files, lazy loading
+
+    fn long_file(dir: &tempfile::TempDir, lines: usize) -> PathBuf {
+        let mut source = String::new();
+        for index in 0..lines {
+            source.push_str(&format!("fn item_{index}() {{ let marker_{index} = {index}; }}\n"));
+        }
+        let path = dir.path().join("long.rs");
+        fs::write(&path, source).unwrap();
+        path
+    }
+
+    #[test]
+    fn opening_a_long_file_only_highlights_the_first_chunk() {
+        let dir = project();
+        let mut app = app(&dir);
+        let path = long_file(&dir, 6000);
+        app.open_file(path, None, true);
+        assert!(app.viewer.is_partial());
+        assert!(app.viewer.doc.lines.len() < 1000);
+        // Scrolling a little does not load anything else...
+        app.focus = Focus::Viewer;
+        for _ in 0..50 {
+            press(&mut app, KeyCode::Down);
+            app.tick();
+        }
+        let (loaded_early, _) = app.viewer.highlighted_lines().unwrap();
+        assert_eq!(loaded_early, crate::viewer::INITIAL_LINES);
+        // ...but going on towards the end does, a chunk at a time.
+        for _ in 0..200 {
+            press(&mut app, KeyCode::Down);
+            app.tick();
+        }
+        let (loaded_later, total) = app.viewer.highlighted_lines().unwrap();
+        assert!(loaded_later > loaded_early && loaded_later < total);
+    }
+
+    #[test]
+    fn jumping_to_the_end_and_searching_cover_the_whole_file() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.open_file(long_file(&dir, 6000), None, true);
+        app.focus = Focus::Viewer;
+        press(&mut app, KeyCode::End);
+        assert!(!app.viewer.is_partial());
+        assert_eq!(app.viewer.cursor, app.viewer.doc.lines.len() - 1);
+
+        // A fresh view: the search finds text far beyond the first chunk.
+        app.open_file(long_file(&dir, 6000), None, true);
+        app.viewer.go_top();
+        assert!(app.viewer.is_partial() || app.viewer.cursor == 0);
+        app.start_search();
+        for character in "marker_5990".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Enter);
+        let search = app.viewer.search.as_ref().expect("a search is active");
+        assert_eq!(search.matches.len(), 1, "found the line near the end");
+        assert!(app.viewer.cursor > 5000);
+    }
+
+    #[test]
+    fn reloading_a_long_file_returns_to_the_same_place() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.open_file(long_file(&dir, 6000), None, true);
+        app.focus = Focus::Viewer;
+        app.jump_viewer_to(2500);
+        assert_eq!(app.viewer.cursor, 2500);
+        app.reload_current();
+        assert_eq!(app.viewer.cursor, 2500);
     }
 }

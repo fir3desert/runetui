@@ -7,9 +7,10 @@
 use ratatui::style::{Color, Modifier, Style};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{
-    FontStyle, ScopeSelectors, StyleModifier, Theme as SynTheme, ThemeItem, ThemeSettings,
+    FontStyle, HighlightIterator, HighlightState, Highlighter, ScopeSelectors, StyleModifier,
+    Theme as SynTheme, ThemeItem, ThemeSettings,
 };
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
 use crate::markdown::RSpan;
 use crate::ui::themes::{Theme, ThemeName};
@@ -17,6 +18,25 @@ use crate::ui::themes::{Theme, ThemeName};
 pub struct CodeHighlighter {
     syntaxes: SyntaxSet,
     cached_theme: Option<(ThemeName, SynTheme)>,
+}
+
+/// Resumable highlighting of one file: syntect's parser and highlighter state
+/// after the last line that was highlighted.  It lets a long file be coloured
+/// in chunks as the reader scrolls instead of all at once.
+#[derive(Clone)]
+pub struct HighlightSession {
+    parse: ParseState,
+    state: HighlightState,
+    theme: ThemeName,
+}
+
+impl std::fmt::Debug for HighlightSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HighlightSession")
+            .field("theme", &self.theme)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +101,60 @@ impl CodeHighlighter {
             detected,
             lines,
         }
+    }
+
+    /// Start a resumable highlighting session.  `sample` (the first lines of
+    /// the file) is only used to detect the language when `lang` is not known.
+    pub fn start_session(&mut self, lang: &str, sample: &str, theme: &Theme) -> HighlightSession {
+        self.ensure_theme(theme);
+        let (syntax, _, _) = self.resolve(lang, sample);
+        let parse = ParseState::new(syntax);
+        let state = match &self.cached_theme {
+            Some((_, syn_theme)) => {
+                HighlightState::new(&Highlighter::new(syn_theme), ScopeStack::new())
+            }
+            None => HighlightState::new(
+                &Highlighter::new(&SynTheme::default()),
+                ScopeStack::new(),
+            ),
+        };
+        HighlightSession {
+            parse,
+            state,
+            theme: theme.name,
+        }
+    }
+
+    /// Highlight the next `lines` of the file, continuing where the session
+    /// stopped.  The result is the same as highlighting the whole file at once.
+    pub fn highlight_chunk(
+        &mut self,
+        session: &mut HighlightSession,
+        lines: &[String],
+        theme: &Theme,
+    ) -> Vec<Vec<RSpan>> {
+        self.ensure_theme(theme);
+        let Some((_, syn_theme)) = &self.cached_theme else {
+            return lines
+                .iter()
+                .map(|line| vec![RSpan::new(line.replace('\t', "    "), Style::default())])
+                .collect();
+        };
+        let highlighter = Highlighter::new(syn_theme);
+        let mut out = Vec::with_capacity(lines.len());
+        for line in lines {
+            let fallback = || vec![RSpan::new(line.replace('\t', "    "), Style::default().fg(theme.fg))];
+            let Ok(ops) = session.parse.parse_line(line, &self.syntaxes) else {
+                out.push(fallback());
+                continue;
+            };
+            let spans = HighlightIterator::new(&mut session.state, &ops, line, &highlighter)
+                .filter(|(_, text)| !text.is_empty())
+                .map(|(style, text)| RSpan::new(text.replace('\t', "    "), convert_style(&style)))
+                .collect::<Vec<_>>();
+            out.push(spans);
+        }
+        out
     }
 
     fn ensure_theme(&mut self, theme: &Theme) {

@@ -239,6 +239,8 @@ mod tests {
         let mut app = app(&dir);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.overlay, Overlay::Menu { .. }));
+        // The version appears once the opening sweep has finished.
+        app.finish_menu_animation();
         let text = render_to_text(&mut app, 120, 40);
         assert!(text.contains("███████████"), "block-letter banner");
         assert!(text.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
@@ -559,5 +561,167 @@ mod tests {
                 let _ = render_to_text(&mut app, width, height);
             }
         }
+    }
+
+    #[test]
+    fn esc_menu_shows_the_stars_and_the_credit_in_the_corners() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.stars.set_for_test(crate::stars::StarsState::Count(1234));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.finish_menu_animation();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String { (0..120u16).map(|x| buffer[(x, y)].symbol()).collect() };
+        // Stars: first row, flush right.
+        assert!(row(0).trim_end().ends_with("★ 1.2k"), "{:?}", row(0));
+        // Credit: last row, flush right.
+        assert!(row(39).trim_end().ends_with("Made By - fir3"), "{:?}", row(39));
+    }
+
+    #[test]
+    fn the_star_count_is_hidden_when_switched_off_but_the_credit_stays() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.config.show_stars = false;
+        app.stars.set_enabled(false);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.finish_menu_animation();
+        let text = render_to_text(&mut app, 120, 40);
+        assert!(!text.contains('★'));
+        assert!(text.contains("Made By - fir3"));
+    }
+
+    #[test]
+    fn unavailable_stars_show_a_dash() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.stars.set_for_test(crate::stars::StarsState::Unavailable);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.finish_menu_animation();
+        let text = render_to_text(&mut app, 120, 40);
+        assert!(text.contains("★ —"));
+    }
+
+    #[test]
+    fn small_terminals_do_not_break_the_corner_texts() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.stars.set_for_test(crate::stars::StarsState::Count(5));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        for (width, height) in [(10, 4), (20, 6), (40, 10), (60, 14)] {
+            let _ = render_to_text(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn the_key_bindings_option_explains_the_capture() {
+        let dir = project();
+        let mut app = app(&dir);
+        let selected = crate::app::OPTION_TABS[0]
+            .items
+            .iter()
+            .position(|item| *item == crate::app::OptionItem::Keys)
+            .unwrap();
+        app.overlay = Overlay::Options { tab: 0, selected };
+        let text = render_to_text(&mut app, 120, 40);
+        assert!(text.contains("prefix Ctrl+R"));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let text = render_to_text(&mut app, 120, 40);
+        assert!(text.contains("press a key"), "the value shows it is waiting");
+    }
+
+    #[test]
+    fn corner_texts_leave_no_stray_letters_of_the_interface() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.stars.set_for_test(crate::stars::StarsState::Count(42));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.finish_menu_animation();
+        for width in [70u16, 80, 100, 120, 140] {
+            let backend = TestBackend::new(width, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let top: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+            let bottom: String = (0..width).map(|x| buffer[(x, 39)].symbol()).collect();
+            let star_at = top.find('★').expect("stars drawn");
+            assert!(top[star_at..].trim_end().ends_with("★ 42"), "{top:?}");
+            // Nothing but spaces between the label and the border of the screen.
+            let after = &top[star_at + "★ 42".len()..];
+            assert!(after.trim().is_empty(), "stray text after the stars: {top:?}");
+            assert!(bottom.trim_end().ends_with("Made By - fir3"), "{bottom:?}");
+            // Never glued to the status text before it.
+            assert!(bottom.contains(" Made By - fir3"), "{bottom:?}");
+            assert!(top.contains(" ★ 42"), "{top:?}");
+        }
+    }
+
+    fn header_row(app: &mut App, width: u16) -> String {
+        let backend = TestBackend::new(width, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
+    }
+
+    #[test]
+    fn the_header_always_shows_the_stars_left_of_the_document_kind() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.stars.set_for_test(crate::stars::StarsState::Count(1234));
+        for width in [80u16, 120, 209] {
+            let top = header_row(&mut app, width);
+            let star = top.find('★').expect("stars in the header");
+            assert!(top[star..].contains("★ 1.2k"), "{top:?}");
+            let kind = app.viewer.kind_label.clone();
+            let after = &top[star + "★ 1.2k".len()..];
+            assert!(after.contains(kind.as_str()), "kind badge after the stars: {top:?}");
+            assert!(after.trim_end().ends_with('%') || after.trim_end().ends_with('—'), "{top:?}");
+        }
+    }
+
+    #[test]
+    fn the_header_stars_follow_the_state_and_the_option() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.stars.set_for_test(crate::stars::StarsState::Loading);
+        assert!(header_row(&mut app, 120).contains("★ …"));
+        app.stars.set_for_test(crate::stars::StarsState::Unavailable);
+        assert!(header_row(&mut app, 120).contains("★ —"));
+        app.config.show_stars = false;
+        app.stars.set_enabled(false);
+        assert!(!header_row(&mut app, 120).contains('★'));
+    }
+
+    #[test]
+    fn narrow_headers_drop_the_stars_first_and_keep_the_rest() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.stars.set_for_test(crate::stars::StarsState::Count(42));
+        let mut dropped = false;
+        for width in (10u16..=60).rev() {
+            let top = header_row(&mut app, width);
+            assert_eq!(top.chars().count(), width as usize);
+            if !top.contains('★') {
+                dropped = true;
+            } else {
+                assert!(!dropped, "stars never come back at {width}: {top:?}");
+            }
+        }
+        assert!(dropped, "the stars give way when there is no room");
+    }
+
+    #[test]
+    fn the_esc_menu_draws_the_stars_once() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.stars.set_for_test(crate::stars::StarsState::Count(42));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.finish_menu_animation();
+        let top = header_row(&mut app, 120);
+        assert_eq!(top.matches('★').count(), 1, "{top:?}");
     }
 }

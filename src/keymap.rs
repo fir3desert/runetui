@@ -52,6 +52,7 @@ pub enum Action {
     ExplorerGrow,
     TerminalGrow,
     TerminalShrink,
+    ForceClose,
 }
 
 struct Meta {
@@ -245,6 +246,13 @@ const META: &[Meta] = &[
         short: "terminal −",
         description: "Shrink the terminal (bottom panel)",
         defaults: &["prefix down", "ctrl+down"],
+    },
+    Meta {
+        action: Action::ForceClose,
+        name: "force_close",
+        short: "kill pane",
+        description: "Kill the focused editor or terminal, even if it is hung",
+        defaults: &["prefix x"],
     },
 ];
 
@@ -462,6 +470,43 @@ impl Chord {
         KeyEvent::new(self.code, modifiers)
     }
 
+    /// Config-file spelling of this key, the inverse of [`Chord::parse`]:
+    /// `ctrl+r`, `alt+x`, `f5`, `T`.
+    pub fn spec(&self) -> String {
+        let mut text = String::new();
+        if self.ctrl {
+            text.push_str("ctrl+");
+        }
+        if self.alt {
+            text.push_str("alt+");
+        }
+        if self.shift {
+            text.push_str("shift+");
+        }
+        match self.code {
+            KeyCode::Char(' ') => text.push_str("space"),
+            KeyCode::Char(character) => text.push(character),
+            KeyCode::Esc => text.push_str("esc"),
+            KeyCode::Enter => text.push_str("enter"),
+            KeyCode::Tab => text.push_str("tab"),
+            KeyCode::BackTab => text.push_str("backtab"),
+            KeyCode::Backspace => text.push_str("backspace"),
+            KeyCode::Delete => text.push_str("delete"),
+            KeyCode::Insert => text.push_str("insert"),
+            KeyCode::Home => text.push_str("home"),
+            KeyCode::End => text.push_str("end"),
+            KeyCode::PageUp => text.push_str("pageup"),
+            KeyCode::PageDown => text.push_str("pagedown"),
+            KeyCode::Up => text.push_str("up"),
+            KeyCode::Down => text.push_str("down"),
+            KeyCode::Left => text.push_str("left"),
+            KeyCode::Right => text.push_str("right"),
+            KeyCode::F(number) => text.push_str(&format!("f{number}")),
+            other => text.push_str(&format!("{other:?}").to_ascii_lowercase()),
+        }
+        text
+    }
+
     /// Human-readable label: `Ctrl+B`, `Tab`, `←`, `T`.
     pub fn label(&self) -> String {
         let mut text = String::new();
@@ -646,6 +691,47 @@ impl Keymap {
 
     pub fn prefix_label(&self) -> String {
         self.prefix.label()
+    }
+
+    /// Can `chord` become the prefix?  Explains why not otherwise.  The prefix
+    /// must survive being typed in a terminal and must not steal a shortcut.
+    pub fn check_prefix(&self, chord: Chord) -> Result<(), String> {
+        if chord == self.prefix {
+            return Ok(());
+        }
+        let function_key = matches!(chord.code, KeyCode::F(_));
+        if !(chord.ctrl || chord.alt || function_key) {
+            return Err(format!(
+                "{} needs Ctrl or Alt (or use an F key): a bare key is typed text",
+                chord.label()
+            ));
+        }
+        if chord.ctrl && !chord.alt {
+            let twin = match chord.code {
+                KeyCode::Char('i') => Some("Tab"),
+                KeyCode::Char('m') | KeyCode::Char('j') => Some("Enter"),
+                KeyCode::Char('h') => Some("Backspace"),
+                KeyCode::Char('[') => Some("Esc"),
+                _ => None,
+            };
+            if let Some(twin) = twin {
+                return Err(format!(
+                    "{} cannot be told apart from {twin} in most terminals",
+                    chord.label()
+                ));
+            }
+        }
+        for binding in &self.bindings {
+            let first = binding.chords[0];
+            if first == chord && first != self.prefix {
+                return Err(format!(
+                    "{} is already used by “{}”",
+                    chord.label(),
+                    binding.action.short()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Decide what `key` means.  While `captured` (the terminal or an embedded
@@ -962,5 +1048,37 @@ mod tests {
         let text = toml::to_string_pretty(&Holder { keys: specs.clone() }).unwrap();
         let back: Holder = toml::from_str(&text).unwrap();
         assert_eq!(back.keys, specs);
+    }
+
+    #[test]
+    fn spec_is_the_inverse_of_parse() {
+        for spec in [
+            "ctrl+r", "alt+x", "f5", "ctrl+alt+z", "T", "esc", "space", "ctrl+left", "pageup",
+            "ctrl+]", "alt+X", "shift+tab", "ctrl++", "f12", "backspace", "delete",
+        ] {
+            let chord = Chord::parse(spec).unwrap();
+            assert_eq!(Chord::parse(&chord.spec()).unwrap(), chord, "{spec}");
+        }
+        assert_eq!(Chord::parse("Ctrl+R").unwrap().spec(), "ctrl+r");
+        assert_eq!(Chord::parse("alt+space").unwrap().spec(), "alt+space");
+    }
+
+    #[test]
+    fn prefix_candidates_are_validated() {
+        let keymap = Keymap::default();
+        let ok = |spec: &str| keymap.check_prefix(Chord::parse(spec).unwrap());
+        assert!(ok("ctrl+a").is_ok());
+        assert!(ok("alt+x").is_ok());
+        assert!(ok("f9").is_ok());
+        assert!(ok("ctrl+r").is_ok(), "the current prefix is accepted");
+        assert!(ok("x").unwrap_err().contains("Ctrl or Alt"));
+        assert!(ok("ctrl+i").unwrap_err().contains("Tab"));
+        assert!(ok("ctrl+m").unwrap_err().contains("Enter"));
+        assert!(ok("ctrl+h").unwrap_err().contains("Backspace"));
+        assert!(ok("ctrl+j").unwrap_err().contains("Enter"));
+        assert!(ok("ctrl+[").unwrap_err().contains("Esc"));
+        // Ctrl+T toggles the terminal and Ctrl+C quits by default.
+        assert!(ok("ctrl+t").unwrap_err().contains("already used"));
+        assert!(ok("ctrl+c").unwrap_err().contains("already used"));
     }
 }

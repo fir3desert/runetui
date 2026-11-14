@@ -32,6 +32,7 @@ pub fn sections(keymap: &Keymap) -> Vec<HelpSection> {
                 entry(keymap, Action::ExplorerGrow, "Grow the explorer (left panel)"),
                 entry(keymap, Action::TerminalGrow, "Grow the terminal (bottom panel)"),
                 entry(keymap, Action::TerminalShrink, "Shrink the terminal (bottom panel)"),
+                entry(keymap, Action::ForceClose, "Emergency: kill a hung editor or terminal"),
                 fixed(
                     "← / →",
                     "Tree: go to parent / expand or descend · Document: ← to explorer",

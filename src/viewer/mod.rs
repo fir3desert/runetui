@@ -13,14 +13,42 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
-use crate::markdown::code_highlighter::{CodeHighlighter, canonical_label, sniff_language};
+use crate::markdown::code_highlighter::{
+    CodeHighlighter, HighlightSession, canonical_label, sniff_language,
+};
 use crate::markdown::parser::Block;
-use crate::markdown::{Heading, RenderedDoc, parse, renderer, toc};
+use crate::markdown::{Heading, RSpan, RenderedDoc, parse, renderer, toc};
 use crate::ui::themes::{Theme, ThemeName};
 
 /// Preview limit.  Larger files are reported as unsupported instead of
 /// freezing the interface.
 pub const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;
+
+/// Source files with at least this many lines are highlighted lazily.
+pub const LAZY_MIN_LINES: usize = 400;
+/// Source lines highlighted when a long file is opened.
+pub const INITIAL_LINES: usize = 200;
+/// Source lines highlighted each time the reader gets close to the end of
+/// what is already shown.
+pub const CHUNK_LINES: usize = 300;
+/// How many rendered rows below the viewport are kept ready.
+pub const LOOKAHEAD_ROWS: usize = 60;
+
+/// Highlighting progress of a long source file: only the first `spans.len()`
+/// lines are coloured and rendered, the rest waits until it is scrolled to.
+#[derive(Debug)]
+pub struct LazyCode {
+    session: HighlightSession,
+    theme: ThemeName,
+    spans: Vec<Vec<RSpan>>,
+    total: usize,
+}
+
+impl LazyCode {
+    fn is_complete(&self) -> bool {
+        self.spans.len() >= self.total
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocKind {
@@ -239,20 +267,70 @@ pub fn format_size(bytes: u64) -> String {
 }
 
 /// Render a loaded document for the given width and theme.
+#[allow(dead_code)]
 pub fn render_loaded(
     loaded: &LoadedDoc,
     width: usize,
     theme: Theme,
     highlighter: &mut CodeHighlighter,
 ) -> RenderedDoc {
+    render_document(loaded, width, theme, highlighter, None).0
+}
+
+/// Like [`render_loaded`], but long source files are only highlighted up to
+/// the point already reached (`previous`) or the first chunk, and the state to
+/// continue from is returned.
+fn render_document(
+    loaded: &LoadedDoc,
+    width: usize,
+    theme: Theme,
+    highlighter: &mut CodeHighlighter,
+    previous: Option<LazyCode>,
+) -> (RenderedDoc, Option<LazyCode>) {
     match &loaded.content {
-        ParsedContent::Markdown(blocks) => renderer::render(blocks, width, theme, highlighter),
-        ParsedContent::Plain(lines) => text::render_plain(lines, width, theme),
-        ParsedContent::Code { lang, lines, .. } => {
-            syntax::render_code(lines, lang, width, theme, highlighter)
+        ParsedContent::Markdown(blocks) => {
+            (renderer::render(blocks, width, theme, highlighter), None)
         }
+        ParsedContent::Plain(lines) => (text::render_plain(lines, width, theme), None),
+        ParsedContent::Code { lang, lines, .. } if lines.len() >= LAZY_MIN_LINES => {
+            let total = lines.len();
+            let lazy = match previous {
+                // Same theme: the colours are still valid, only re-wrap.
+                Some(lazy) if lazy.theme == theme.name && lazy.total == total => lazy,
+                other => {
+                    let keep = other
+                        .map_or(INITIAL_LINES, |lazy| lazy.spans.len())
+                        .clamp(1, total);
+                    let sample = lines
+                        .iter()
+                        .take(syntax::SAMPLE_LINES)
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let mut session = highlighter.start_session(lang, &sample, &theme);
+                    let spans = highlighter.highlight_chunk(&mut session, &lines[..keep], &theme);
+                    LazyCode {
+                        session,
+                        theme: theme.name,
+                        spans,
+                        total,
+                    }
+                }
+            };
+            let layout = syntax::code_layout(total, width);
+            let mut doc = RenderedDoc::default();
+            doc.lines = syntax::render_code_range(&lazy.spans, 0, layout, theme);
+            if lazy.is_complete() {
+                doc.lines.extend(syntax::closing_lines(layout, theme));
+            }
+            (doc, Some(lazy))
+        }
+        ParsedContent::Code { lang, lines, .. } => (
+            syntax::render_code(lines, lang, width, theme, highlighter),
+            None,
+        ),
         ParsedContent::Message { title, detail } => {
-            text::render_message(title, detail, width, theme)
+            (text::render_message(title, detail, width, theme), None)
         }
     }
 }
@@ -332,6 +410,8 @@ pub struct Viewer {
     pub title: String,
     pub kind_label: String,
     welcome_source: Option<String>,
+    /// Set while a long source file is only partly highlighted.
+    lazy: Option<LazyCode>,
 }
 
 impl Default for Viewer {
@@ -348,6 +428,7 @@ impl Default for Viewer {
             title: "Welcome".to_string(),
             kind_label: "home".to_string(),
             welcome_source: None,
+            lazy: None,
         }
     }
 }
@@ -368,7 +449,8 @@ impl Viewer {
         self.title = loaded.display_name();
         self.kind_label = loaded.badge();
         self.welcome_source = None;
-        let doc = render_loaded(&loaded, width, theme, highlighter);
+        let (doc, lazy) = render_document(&loaded, width, theme, highlighter, None);
+        self.lazy = lazy;
         let cursor = anchor
             .and_then(|anchor| toc::resolve_anchor(&doc.headings, anchor))
             .unwrap_or(0);
@@ -418,6 +500,7 @@ impl Viewer {
         );
         let blocks = parse(&source);
         self.loaded = None;
+        self.lazy = None;
         self.doc = renderer::render(&blocks, width, theme, highlighter);
         self.title = "Welcome".to_string();
         self.kind_label = "home".to_string();
@@ -438,8 +521,11 @@ impl Viewer {
             .and_then(SearchState::current_match)
             .map(|item| item.line);
 
-        if let Some(loaded) = &self.loaded {
-            self.doc = render_loaded(loaded, width, theme, highlighter);
+        if let Some(loaded) = self.loaded.clone() {
+            let previous = self.lazy.take();
+            let (doc, lazy) = render_document(&loaded, width, theme, highlighter, previous);
+            self.doc = doc;
+            self.lazy = lazy;
         } else if let Some(source) = &self.welcome_source {
             let blocks = parse(source);
             self.doc = renderer::render(&blocks, width, theme, highlighter);
@@ -472,6 +558,64 @@ impl Viewer {
         }
 
         self.ensure_visible();
+    }
+
+    // ---------------------------------------------------- lazy highlighting
+
+    /// True while a long source file is only partly highlighted.
+    pub fn is_partial(&self) -> bool {
+        self.lazy.as_ref().is_some_and(|lazy| !lazy.is_complete())
+    }
+
+    /// The reader is close to the end of what has been highlighted so far.
+    pub fn needs_more(&self) -> bool {
+        self.is_partial()
+            && self.cursor + self.viewport_height + LOOKAHEAD_ROWS >= self.doc.lines.len()
+    }
+
+    /// Highlight and append the next chunk.  Returns false when there was
+    /// nothing to do.
+    pub fn load_more(&mut self, theme: Theme, highlighter: &mut CodeHighlighter) -> bool {
+        let Some(loaded) = self.loaded.clone() else {
+            return false;
+        };
+        let ParsedContent::Code { lines, .. } = &loaded.content else {
+            return false;
+        };
+        let Some(lazy) = self.lazy.as_mut() else {
+            return false;
+        };
+        if lazy.is_complete() || lazy.theme != theme.name {
+            return false;
+        }
+        let from = lazy.spans.len();
+        let to = (from + CHUNK_LINES).min(lazy.total);
+        let chunk = highlighter.highlight_chunk(&mut lazy.session, &lines[from..to], &theme);
+        let layout = syntax::code_layout(lazy.total, self.rendered_width);
+        self.doc
+            .lines
+            .extend(syntax::render_code_range(&chunk, from, layout, theme));
+        lazy.spans.extend(chunk);
+        if lazy.is_complete() {
+            self.doc.lines.extend(syntax::closing_lines(layout, theme));
+        }
+        true
+    }
+
+    /// Highlight the whole file (search, jump to the end...).
+    pub fn load_all(&mut self, theme: Theme, highlighter: &mut CodeHighlighter) {
+        while self.load_more(theme, highlighter) {}
+    }
+
+    /// Make sure rendered row `line` exists, loading chunks as needed.
+    pub fn load_through(&mut self, line: usize, theme: Theme, highlighter: &mut CodeHighlighter) {
+        while self.doc.lines.len() <= line && self.load_more(theme, highlighter) {}
+    }
+
+    /// Number of source lines highlighted so far and the file's total.
+    #[allow(dead_code)]
+    pub fn highlighted_lines(&self) -> Option<(usize, usize)> {
+        self.lazy.as_ref().map(|lazy| (lazy.spans.len(), lazy.total))
     }
 
     pub fn heading_nearest_cursor(&self) -> Option<&Heading> {
@@ -545,15 +689,21 @@ impl Viewer {
     }
 
     pub fn progress(&self) -> usize {
-        let total = self.doc.lines.len();
+        let total = self.total_lines();
         if total <= 1 {
             return 100;
         }
         (self.cursor * 100 / (total - 1)).min(100)
     }
 
+    /// Rendered rows; for a partly highlighted file an estimate of the whole.
     pub fn total_lines(&self) -> usize {
-        self.doc.lines.len()
+        match &self.lazy {
+            Some(lazy) if !lazy.is_complete() && !lazy.spans.is_empty() => {
+                self.doc.lines.len() * lazy.total / lazy.spans.len()
+            }
+            _ => self.doc.lines.len(),
+        }
     }
 
     // ------------------------------------------------------------- search
@@ -796,5 +946,190 @@ mod tests {
         file.write_all(&data).unwrap();
         let loaded = load_document(file.path()).unwrap();
         assert_eq!(loaded.kind, DocKind::TooLarge);
+    }
+
+    fn long_rust_source(lines: usize) -> String {
+        let mut source = String::new();
+        for index in 0..lines {
+            source.push_str(&format!("fn function_{index}() -> usize {{ {index} }}\n"));
+        }
+        source
+    }
+
+    fn temp_rust(lines: usize) -> tempfile::NamedTempFile {
+        let mut file = tempfile::Builder::new().suffix(".rs").tempfile().unwrap();
+        file.write_all(long_rust_source(lines).as_bytes()).unwrap();
+        file
+    }
+
+    fn rows_with_colours(doc: &RenderedDoc) -> Vec<(String, Vec<Option<ratatui::style::Color>>)> {
+        doc.lines
+            .iter()
+            .map(|line| (line.text(), line.spans.iter().map(|span| span.style.fg).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn long_source_files_are_only_highlighted_up_to_the_first_chunk() {
+        let file = temp_rust(5000);
+        let mut highlighter = CodeHighlighter::new();
+        let mut viewer = Viewer::default();
+        viewer.set_viewport_height(30);
+        viewer.show(
+            Arc::new(load_document(file.path()).unwrap()),
+            80,
+            catppuccin_mocha(),
+            &mut highlighter,
+            None,
+        );
+        assert_eq!(viewer.highlighted_lines(), Some((INITIAL_LINES, 5000)));
+        assert!(viewer.is_partial());
+        assert!(viewer.doc.lines.len() < 400, "only the first chunk is rendered");
+        // The gutter is sized for the whole file from the start.
+        assert!(viewer.doc.lines[0].text().starts_with("   1 │"));
+        // The scroll position still reflects the size of the file.
+        assert!(viewer.total_lines() > 4000);
+        // Not near the end yet: nothing more is loaded.
+        assert!(!viewer.needs_more());
+    }
+
+    #[test]
+    fn short_source_files_are_rendered_in_one_go() {
+        let file = temp_rust(LAZY_MIN_LINES - 1);
+        let mut highlighter = CodeHighlighter::new();
+        let mut viewer = Viewer::default();
+        viewer.show(
+            Arc::new(load_document(file.path()).unwrap()),
+            80,
+            catppuccin_mocha(),
+            &mut highlighter,
+            None,
+        );
+        assert!(!viewer.is_partial());
+        assert_eq!(viewer.highlighted_lines(), None);
+    }
+
+    #[test]
+    fn scrolling_towards_the_end_loads_more_chunks() {
+        let file = temp_rust(5000);
+        let theme = catppuccin_mocha();
+        let mut highlighter = CodeHighlighter::new();
+        let mut viewer = Viewer::default();
+        viewer.set_viewport_height(30);
+        viewer.show(
+            Arc::new(load_document(file.path()).unwrap()),
+            80,
+            theme,
+            &mut highlighter,
+            None,
+        );
+        // 200 rows are ready; the viewport (30) plus the look-ahead (60) must fit.
+        viewer.move_cursor(100);
+        assert!(!viewer.needs_more());
+        viewer.move_cursor(20);
+        assert!(viewer.needs_more());
+        assert!(viewer.load_more(theme, &mut highlighter));
+        assert_eq!(
+            viewer.highlighted_lines(),
+            Some((INITIAL_LINES + CHUNK_LINES, 5000))
+        );
+        assert!(!viewer.needs_more());
+    }
+
+    #[test]
+    fn chunked_highlighting_matches_highlighting_the_whole_file() {
+        let file = temp_rust(900);
+        let theme = catppuccin_mocha();
+        let mut highlighter = CodeHighlighter::new();
+        let loaded = Arc::new(load_document(file.path()).unwrap());
+        let mut viewer = Viewer::default();
+        viewer.show(loaded.clone(), 80, theme, &mut highlighter, None);
+        viewer.load_all(theme, &mut highlighter);
+        assert!(!viewer.is_partial());
+
+        let ParsedContent::Code { lang, lines } = &loaded.content else {
+            panic!("expected code");
+        };
+        let eager = syntax::render_code(lines, lang, 80, theme, &mut highlighter);
+        assert_eq!(rows_with_colours(&viewer.doc), rows_with_colours(&eager));
+    }
+
+    #[test]
+    fn load_through_reaches_a_far_row() {
+        let file = temp_rust(5000);
+        let theme = catppuccin_mocha();
+        let mut highlighter = CodeHighlighter::new();
+        let mut viewer = Viewer::default();
+        viewer.show(
+            Arc::new(load_document(file.path()).unwrap()),
+            80,
+            theme,
+            &mut highlighter,
+            None,
+        );
+        viewer.load_through(1500, theme, &mut highlighter);
+        assert!(viewer.doc.lines.len() > 1500);
+        assert!(viewer.is_partial(), "the rest still waits");
+    }
+
+    #[test]
+    fn resizing_keeps_the_progress_and_changing_theme_recolours_it() {
+        let file = temp_rust(5000);
+        let theme = catppuccin_mocha();
+        let mut highlighter = CodeHighlighter::new();
+        let mut viewer = Viewer::default();
+        viewer.set_viewport_height(30);
+        viewer.show(
+            Arc::new(load_document(file.path()).unwrap()),
+            80,
+            theme,
+            &mut highlighter,
+            None,
+        );
+        viewer.load_more(theme, &mut highlighter);
+        let reached = viewer.highlighted_lines();
+        viewer.rerender(60, theme, &mut highlighter);
+        assert_eq!(viewer.highlighted_lines(), reached);
+        assert_eq!(viewer.rendered_width, 60);
+
+        let other = crate::ui::themes::ThemeName::TokyoNight.theme();
+        viewer.rerender(60, other, &mut highlighter);
+        assert_eq!(viewer.highlighted_lines(), reached);
+        assert_eq!(viewer.rendered_theme, Some(other.name));
+    }
+
+    /// Manual benchmark: `cargo test --release bench_ -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_first_chunk_versus_whole_file() {
+        let source = include_str!("../app.rs");
+        let mut file = tempfile::Builder::new().suffix(".rs").tempfile().unwrap();
+        file.write_all(source.as_bytes()).unwrap();
+        let theme = catppuccin_mocha();
+        let loaded = Arc::new(load_document(file.path()).unwrap());
+        let mut highlighter = CodeHighlighter::new();
+        // Warm the syntax set and the theme.
+        let mut warm = Viewer::default();
+        warm.show(loaded.clone(), 100, theme, &mut highlighter, None);
+
+        let started = std::time::Instant::now();
+        let mut viewer = Viewer::default();
+        viewer.show(loaded.clone(), 100, theme, &mut highlighter, None);
+        let first = started.elapsed();
+
+        let started = std::time::Instant::now();
+        viewer.load_all(theme, &mut highlighter);
+        let rest = started.elapsed();
+
+        let ParsedContent::Code { lang, lines } = &loaded.content else {
+            panic!("code expected");
+        };
+        let started = std::time::Instant::now();
+        let _ = syntax::render_code(lines, lang, 100, theme, &mut highlighter);
+        let whole = started.elapsed();
+        println!(
+            "{} lines: first chunk {first:?}, remaining chunks {rest:?}, whole file at once {whole:?}",
+            lines.len()
+        );
     }
 }

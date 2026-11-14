@@ -314,7 +314,104 @@ pub fn render_menu(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
     } else {
         render_compact_menu(frame, area, &theme, selected);
     }
+    draw_corners(frame, area, app, &theme);
 }
+
+/// Colour of the star count.
+pub const STAR_COLOR: Color = Color::Rgb(0xf5, 0xc2, 0x4b);
+
+/// Star count of the repository at the top right and the credit at the
+/// bottom right of the screen.
+fn draw_corners(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    if area.width < 12 || area.height < 3 {
+        return;
+    }
+    if let Some(text) = crate::stars::label(app.stars.state()) {
+        let width = UnicodeWidthStr::width(text.as_str()) as u16;
+        if width + 3 <= area.width {
+            // A leading blank keeps it apart from the header text.
+            put_corner(
+                frame,
+                area.right() - width - 2,
+                area.y,
+                &format!(" {text}"),
+                Style::default().fg(STAR_COLOR).add_modifier(Modifier::BOLD),
+            );
+        }
+    }
+    // The key hint is centred on the same row; leave it alone when they meet.
+    let credit = CREDIT;
+    let width = UnicodeWidthStr::width(credit) as u16;
+    let hint_width = UnicodeWidthStr::width(MENU_HINT) as u16;
+    let hint_end = centered_x(area, hint_width) + hint_width;
+    let x = area.right().saturating_sub(width + 1);
+    if width + 2 <= area.width && x > hint_end {
+        put_corner(
+            frame,
+            x - 1,
+            area.bottom() - 1,
+            &format!(" {credit}"),
+            Style::default().fg(theme.fg_muted),
+        );
+    }
+}
+
+/// Draw `text` at `(x, y)` over whatever is there, spaces included, keeping the
+/// (darkened) background.  A word of the interface that the text would cut in
+/// half is blanked completely, so no stray letters stay next to it.
+fn put_corner(frame: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
+    let area = frame.area();
+    if y >= area.bottom() || x >= area.right() {
+        return;
+    }
+    let width = UnicodeWidthStr::width(text) as u16;
+    let buffer = frame.buffer_mut();
+    let mut start = x;
+    while start > area.x
+        && buffer
+            .cell((start - 1, y))
+            .is_some_and(|cell| cell.symbol() != " ")
+        && buffer.cell((x, y)).is_some_and(|cell| cell.symbol() != " ")
+    {
+        start -= 1;
+    }
+    for column in start..x {
+        if let Some(cell) = buffer.cell_mut((column, y)) {
+            cell.set_symbol(" ");
+        }
+    }
+    let mut column = x;
+    for character in text.chars() {
+        if column >= area.right() || column >= x + width {
+            break;
+        }
+        if let Some(cell) = buffer.cell_mut((column, y)) {
+            cell.set_symbol(&character.to_string());
+            cell.modifier = style.add_modifier;
+            if let Some(foreground) = style.fg {
+                cell.set_fg(foreground);
+            }
+        }
+        column += UnicodeWidthStr::width(character.to_string().as_str()).max(1) as u16;
+    }
+    // Blank the rest of a word that continues past the end of the text.
+    let mut tail = x.saturating_add(width);
+    while tail < area.right()
+        && buffer
+            .cell((tail, y))
+            .is_some_and(|cell| cell.symbol() != " ")
+    {
+        if let Some(cell) = buffer.cell_mut((tail, y)) {
+            cell.set_symbol(" ");
+        }
+        tail += 1;
+    }
+}
+
+/// Credit drawn at the bottom right of the Esc menu.
+pub const CREDIT: &str = "Made By - fir3";
+/// Key hint drawn centred on the menu's last row.
+const MENU_HINT: &str = " ↑ / ↓ select · Enter open · Esc close ";
 
 /// The banner plus the version under its right edge, in fixed brand colours.
 /// With `elapsed` the opening animation is drawn at that point in time; `None`
@@ -389,7 +486,7 @@ fn render_big_menu(
         y += 4;
     }
 
-    hint(frame, area, theme, " ↑ / ↓ select · Enter open · Esc close ");
+    hint(frame, area, theme, MENU_HINT);
 }
 
 fn render_compact_menu(frame: &mut Frame, area: Rect, theme: &Theme, selected: usize) {
@@ -510,13 +607,46 @@ fn option_text(app: &App, item: OptionItem) -> OptionText {
                           own selection returns (it selects across panels)."
                 .into(),
         },
-        OptionItem::Keys => OptionText {
-            label: "Key bindings",
-            value: format!("prefix {}", app.keymap.prefix_label()),
-            description: "Every shortcut is configurable: edit the [keys] table of config.toml \
-                          (e.g. quit = [\"q\", \"ctrl+c\"]) and `prefix`. Two-key shortcuts \
-                          are written \"prefix left\". Enter shows the file path."
+        OptionItem::Keys => {
+            let place = crate::config::Config::path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "config.toml".to_string());
+            if app.capturing_prefix {
+                OptionText {
+                    label: "Key bindings",
+                    value: "press a key…".to_string(),
+                    description: "Press the key that should become the prefix: Ctrl+<letter>, \
+                                  Alt+<key> or an F key. Backspace restores Ctrl+R, Esc cancels."
+                        .into(),
+                }
+            } else {
+                OptionText {
+                    label: "Key bindings",
+                    value: format!("prefix {}", app.keymap.prefix_label()),
+                    description: format!(
+                        "Enter, then press a key to make it the prefix (saved in config.toml). \
+                         The other shortcuts are the [keys] table of {place} (e.g. quit = \
+                         [\"q\", \"ctrl+c\"]); two-key shortcuts are written \"prefix left\"."
+                    ),
+                }
+            }
+        }
+        OptionItem::Animation => OptionText {
+            label: "Banner animation",
+            value: on_off(app.config.banner_animation),
+            description: "Light sweep and shimmer of the RuneTUI banner when the Esc menu \
+                          opens. OFF shows the finished banner right away."
                 .into(),
+        },
+        OptionItem::GithubStars => OptionText {
+            label: "GitHub stars",
+            value: on_off(app.config.show_stars),
+            description: format!(
+                "Show the star count of github.com/{} in the corner of the Esc menu. It is \
+                 fetched once an hour in the background with curl and is the only network \
+                 request runetui makes; OFF keeps it fully offline.",
+                crate::stars::REPO
+            ),
         },
         OptionItem::ShowHidden => OptionText {
             label: "Hidden files",

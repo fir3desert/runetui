@@ -14,6 +14,7 @@ mod filesystem;
 mod keymap;
 mod markdown;
 mod selection;
+mod stars;
 mod ui;
 mod viewer;
 

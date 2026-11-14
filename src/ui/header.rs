@@ -2,7 +2,8 @@
 //!
 //! The project name and path are shown once, in the explorer and the status
 //! bar, so the header stays short: the app badge, the heading under the
-//! cursor, the kind of document and how far down it you are.
+//! cursor, the GitHub star count, the kind of document and how far down it
+//! you are.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -10,7 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 
-use crate::app::App;
+use crate::app::{App, Overlay};
 use crate::ui::bar;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
@@ -39,7 +40,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         "—".to_string()
     };
 
-    let right = vec![
+    let mut right = Vec::new();
+    // The star count sits left of the document kind.  It is the first item
+    // dropped when the bar runs out of room, and the Esc menu draws its own
+    // copy in the same corner, so the header leaves it out then.
+    if !matches!(app.overlay, Overlay::Menu { .. }) {
+        if let Some(label) = crate::stars::label(app.stars.state()) {
+            right.push(Span::styled(
+                format!(" {label} "),
+                Style::default()
+                    .fg(crate::ui::menu::STAR_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    right.extend([
         Span::styled(
             format!(" {} ", app.viewer.kind_label),
             Style::default()
@@ -49,7 +64,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw(" "),
         Span::styled(format!("{position} "), theme.muted()),
-    ];
+    ]);
 
     let line = bar::build(left, right, area.width);
     frame.render_widget(
