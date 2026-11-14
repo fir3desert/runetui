@@ -1,0 +1,563 @@
+//! Terminal user interface.
+//!
+//! Rendering is a pure function of [`App`] state plus the frame area.  The
+//! draw pass also reflows the document when the viewer width changes.
+
+pub mod bar;
+pub mod explorer;
+pub mod header;
+pub mod help;
+pub mod icons;
+pub mod layout;
+pub mod markdown;
+pub mod menu;
+pub mod overlays;
+pub mod statusbar;
+pub mod terminal;
+pub mod themes;
+
+use ratatui::Frame;
+use ratatui::widgets::{Block, Borders};
+
+use crate::app::{App, Focus};
+
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    app.set_terminal_area(area);
+    let theme = app.theme();
+
+    frame.render_widget(Block::default().style(theme.base()), area);
+
+    header::render(frame, app.layout.header, app);
+
+    if let Some(rect) = app.layout.explorer {
+        explorer::render(frame, rect, app);
+    }
+    if let Some(rect) = app.layout.divider {
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(theme.border()),
+            rect,
+        );
+    }
+
+    if app.editor.is_some() {
+        let pane = app.layout.viewer;
+        if let Some(editor) = app.editor.as_mut() {
+            editor.resize(pane.height, pane.width);
+        }
+        if let Some(editor) = &app.editor {
+            let focused = app.focus == Focus::Viewer && !app.overlay.is_open();
+            editor.render(frame, pane, &theme, focused);
+        }
+    } else {
+        markdown::render(frame, app.layout.viewer, app);
+    }
+    terminal::render(frame, app);
+
+    // A mouse selection is painted over its own pane only, and its text is
+    // read back from the screen once the button is released.
+    if let Some(selection) = &app.selection {
+        selection.highlight(frame.buffer_mut(), theme.accent, theme.bg);
+    }
+    app.capture_selection(frame.buffer_mut());
+
+    statusbar::render(frame, app.layout.status, app);
+    overlays::render(frame, area, app);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{App, Focus, Overlay};
+    use crate::config::Config;
+    use crate::ui::themes::ThemeName;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use std::fs;
+
+    fn project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("README.md"),
+            b"# Home\n\nWelcome to the project.\n\n## Section\n\nSome text.\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("other.rs"), b"fn main() {}\n").unwrap();
+        dir
+    }
+
+    fn app(dir: &tempfile::TempDir) -> App {
+        let mut app = App::with_config(Some(dir.path()), Config::default());
+        app.set_terminal_area(Rect::new(0, 0, 100, 30));
+        app
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let area = buffer.area();
+        let mut out = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn render_to_text(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn renders_header_explorer_document_and_status() {
+        let dir = project();
+        let mut app = app(&dir);
+        let text = render_to_text(&mut app, 100, 30);
+        assert!(text.contains("runetui"));
+        assert!(text.contains("README.md"));
+        assert!(text.contains("Home"));
+        assert!(text.contains("Welcome to the project."));
+        assert!(text.contains("EXPLORER"));
+        // The theme name is not in the header any more.
+        assert!(!text.contains("Catppuccin Mocha"));
+        // Bottom-right hints: `edit`, `Esc` and `?` on their own.
+        let status = text.lines().last().unwrap();
+        assert!(status.contains("edit"), "{status}");
+        assert!(status.contains("Esc"), "{status}");
+        assert!(status.contains(" ? "), "{status}");
+        assert!(!status.contains("? help"));
+        assert!(!status.contains("Esc menu"));
+    }
+
+    #[test]
+    fn header_does_not_repeat_the_project_name_or_path() {
+        let dir = project();
+        let mut app = app(&dir);
+        let text = render_to_text(&mut app, 120, 30);
+        let header = text.lines().next().unwrap();
+        let path = dir.path().display().to_string();
+        assert!(header.contains("runetui"));
+        assert!(!header.contains(&path), "no project path in the header: {header}");
+        let name = dir.path().file_name().unwrap().to_string_lossy().to_string();
+        assert!(!header.contains(&name), "no project name in the header: {header}");
+    }
+
+    #[test]
+    fn the_e_of_edit_is_bold() {
+        let dir = project();
+        let mut app = app(&dir);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let y = 29;
+        let row: Vec<&str> = (0..100).map(|x| buffer[(x, y)].symbol()).collect();
+        let position = (0..97)
+            .find(|&x| row[x..x + 4].concat() == "edit")
+            .expect("edit hint in the status bar");
+        let e = &buffer[(position as u16, y)];
+        let d = &buffer[(position as u16 + 1, y)];
+        assert!(e.modifier.contains(ratatui::style::Modifier::BOLD));
+        assert!(!d.modifier.contains(ratatui::style::Modifier::BOLD));
+    }
+
+    #[test]
+    fn explorer_draws_nerd_icons_and_indent_guides() {
+        let dir = project();
+        fs::create_dir_all(dir.path().join("src").join("deep")).unwrap();
+        fs::write(
+            dir.path().join("src").join("deep").join("a.rs"),
+            b"fn a() {}\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.set_icon_style(crate::ui::icons::IconStyle::Nerd);
+        let mut app = App::with_config(Some(dir.path()), config);
+        app.set_terminal_area(Rect::new(0, 0, 100, 30));
+        app.explorer.refresh();
+        for name in ["src", "src/deep"] {
+            assert!(app.explorer.select_visible_path(&dir.path().join(name)));
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        }
+        let text = render_to_text(&mut app, 100, 30);
+        assert!(text.contains('\u{f07c}'), "open folder glyph");
+        assert!(text.contains('\u{e7a8}'), "rust file glyph");
+        assert!(text.contains('│'), "indent guide");
+    }
+
+    #[test]
+    fn explorer_falls_back_to_ascii_icons() {
+        let dir = project();
+        let mut config = Config::default();
+        config.set_icon_style(crate::ui::icons::IconStyle::Ascii);
+        let mut app = App::with_config(Some(dir.path()), config);
+        app.set_terminal_area(Rect::new(0, 0, 100, 30));
+        let text = render_to_text(&mut app, 100, 30);
+        assert!(!text.contains('\u{f07b}'));
+        assert!(text.contains("other.rs"));
+    }
+
+    #[test]
+    fn help_overlay_draws_bindings() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Overlay::Help { .. }));
+        let text = render_to_text(&mut app, 110, 40);
+        assert!(text.contains("Help"));
+        assert!(text.contains("Switch focus"));
+        assert!(text.contains("Ctrl+R"));
+    }
+
+    #[test]
+    fn theme_menu_draws_all_themes() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.overlay = Overlay::Themes {
+            selected: 0,
+            original: app.theme,
+        };
+        let text = render_to_text(&mut app, 110, 40);
+        assert!(text.contains("Choose a theme"));
+        for name in ThemeName::ALL {
+            assert!(text.contains(name.label()), "{}", name.label());
+        }
+        assert!(text.contains("live preview"));
+    }
+
+    #[test]
+    fn esc_menu_shows_banner_version_and_the_three_words() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Overlay::Menu { .. }));
+        let text = render_to_text(&mut app, 120, 40);
+        assert!(text.contains("███████████"), "block-letter banner");
+        assert!(text.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
+        // OPTIONS, HELP and QUIT are drawn with the double-stroke font.
+        assert!(text.contains("╔═╗"));
+        assert!(text.contains("╠═╣"), "the H of HELP");
+        assert!(text.contains("╚═╝╚"), "the Q of QUIT");
+        // The interface behind the menu stays visible (dimmed, not cleared).
+        assert!(text.contains("README.md"), "explorer visible behind the menu");
+        assert!(text.contains("EXPLORER") || text.contains("Home"));
+    }
+
+    fn banner_cell_color(app: &mut App) -> ratatui::style::Color {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..40 {
+            for x in 0..120 {
+                if buffer[(x, y)].symbol() == "█" {
+                    return buffer[(x, y)].fg;
+                }
+            }
+        }
+        panic!("banner not drawn");
+    }
+
+    #[test]
+    fn banner_colours_do_not_follow_the_theme() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.finish_menu_animation();
+        let first = banner_cell_color(&mut app);
+        app.theme = ThemeName::White;
+        let second = banner_cell_color(&mut app);
+        app.theme = ThemeName::Dracula;
+        let third = banner_cell_color(&mut app);
+        assert_eq!(first, second);
+        assert_eq!(first, third);
+        assert!(matches!(first, ratatui::style::Color::Rgb(..)));
+    }
+
+    fn render_buffer(app: &mut App) -> Buffer {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn brightness(color: ratatui::style::Color) -> Option<u32> {
+        match color {
+            ratatui::style::Color::Rgb(r, g, b) => Some(u32::from(r) + u32::from(g) + u32::from(b)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn menu_darkens_the_background_but_keeps_it_readable() {
+        let dir = project();
+        let mut app = app(&dir);
+        let before = render_buffer(&mut app);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.finish_menu_animation();
+        let after = render_buffer(&mut app);
+        let (mut darker, mut brighter, mut kept) = (0, 0, 0);
+        for y in 0..40 {
+            for x in 0..120 {
+                let (a, b) = (&before[(x, y)], &after[(x, y)]);
+                if a.symbol() != b.symbol() {
+                    continue; // the banner and the menu words
+                }
+                kept += 1;
+                if let (Some(old), Some(new)) = (brightness(a.bg), brightness(b.bg)) {
+                    if new < old {
+                        darker += 1;
+                    } else if new > old {
+                        brighter += 1;
+                    }
+                }
+            }
+        }
+        assert!(kept > 500, "most of the interface is still drawn behind the menu");
+        assert!(darker > 500, "the background is darkened");
+        assert!(brighter * 20 < darker, "almost nothing gets brighter (only the hint line)");
+        let dim_cells = |buffer: &Buffer| {
+            buffer
+                .content()
+                .iter()
+                .filter(|cell| cell.modifier.contains(ratatui::style::Modifier::DIM))
+                .count()
+        };
+        assert!(
+            dim_cells(&after) <= dim_cells(&before),
+            "darkening is done with colours, not by adding the DIM attribute"
+        );
+    }
+
+    #[test]
+    fn esc_menu_banner_animates_only_when_opened_with_esc() {
+        let dir = project();
+        let mut app = app(&dir);
+        assert!(app.menu_animation().is_none(), "no animation without the menu");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.menu_animation().is_some(), "Esc starts the animation");
+        // Opening a sub-screen and coming back shows the static banner.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.menu_animation().is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Overlay::Menu { .. }));
+        assert!(app.menu_animation().is_none(), "going back does not replay it");
+        // Closing and opening again with Esc plays it again.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.menu_animation().is_some());
+    }
+
+    #[test]
+    fn menu_blanks_leave_the_background_visible() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let text = render_to_text(&mut app, 120, 40);
+        // The banner rows span the document pane: its blank cells must not
+        // erase the document text that sits under them.
+        let banner_rows: Vec<&str> = text.lines().filter(|l| l.contains("███")).collect();
+        assert!(!banner_rows.is_empty());
+        assert!(text.contains("TERMINAL"), "terminal title bar still visible behind the menu");
+    }
+
+    #[test]
+    fn theme_picker_looks_like_the_esc_menu_and_previews_behind_it() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.overlay = Overlay::Themes { selected: 1, original: app.theme };
+        let text = render_to_text(&mut app, 120, 42);
+        assert!(text.contains("███████████"), "same banner as the Esc menu");
+        assert!(text.contains("❯ Tokyo Night"));
+        assert!(text.contains("README.md"), "interface visible behind it");
+        assert!(!text.contains('┌') || !text.contains("Theme menu"), "no popup frame");
+    }
+
+    #[test]
+    fn terminal_panel_has_a_title_bar_and_a_focus_gutter() {
+        let dir = project();
+        let mut app = app(&dir);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app.layout.terminal.unwrap();
+        let theme = app.theme();
+        let idle = terminal.backend().buffer()[(area.x, area.y + 1)].clone();
+        // With the explorer visible its divider is the line; the gutter stays blank.
+        assert_eq!(idle.symbol(), " ");
+        app.show_explorer = false;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app.layout.terminal.unwrap();
+        let alone = terminal.backend().buffer()[(area.x, area.y + 1)].clone();
+        assert_eq!(alone.symbol(), "│");
+        assert_eq!(alone.fg, theme.border);
+        app.show_explorer = true;
+        app.focus = Focus::Explorer;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app.layout.terminal.unwrap();
+
+        // Tab twice: explorer → document → terminal.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Terminal);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let focused = terminal.backend().buffer()[(area.x, area.y + 1)].clone();
+        assert_eq!(focused.symbol(), "▍", "same bar as the explorer selection");
+        assert_eq!(focused.fg, theme.accent, "the bar is coloured");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("TERMINAL"));
+        assert!(text.lines().last().unwrap().contains("TERMINAL"), "status badge");
+    }
+
+    #[test]
+    fn hidden_terminal_gives_the_space_back() {
+        let dir = project();
+        let mut app = app(&dir);
+        let with = app.layout.viewer.height;
+        app.show_term = false;
+        app.set_terminal_area(Rect::new(0, 0, 100, 30));
+        assert!(app.layout.terminal.is_none());
+        assert!(app.layout.viewer.height > with);
+        let text = render_to_text(&mut app, 100, 30);
+        assert!(!text.contains("TERMINAL"));
+    }
+
+    #[test]
+    fn mouse_selection_highlights_only_its_own_pane() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let dir = project();
+        let mut app = app(&dir);
+        let _ = render_to_text(&mut app, 100, 30);
+        let viewer = app.layout.viewer;
+        let mouse = |kind, x, y| MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE };
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), viewer.x, viewer.y));
+        // Drag far into the explorer and past the bottom of the screen.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 1, viewer.y + 3));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, viewer.y + 3));
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let theme = app.theme();
+        let buffer = terminal.backend().buffer();
+        // Nothing in the explorer column was painted.
+        for y in 1..29 {
+            for x in 0..viewer.x {
+                assert_ne!(buffer[(x, y)].bg, theme.accent, "explorer cell {x},{y} selected");
+            }
+        }
+        let copied = app.take_clipboard().expect("text queued for the clipboard");
+        assert!(copied.contains("Home"), "{copied}");
+        assert!(!copied.contains("EXPLORER"));
+        assert!(!copied.contains("README.md"), "explorer text is never copied: {copied}");
+    }
+
+    #[test]
+    fn esc_menu_collapses_to_a_framed_list_on_small_terminals() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let text = render_to_text(&mut app, 60, 14);
+        assert!(text.contains("RUNETUI"));
+        assert!(text.contains("❯ OPTIONS"));
+        assert!(text.contains("HELP"));
+        assert!(text.contains("QUIT"));
+    }
+
+    #[test]
+    fn options_screen_draws_tabs_settings_and_description() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.overlay = Overlay::Options {
+            tab: 0,
+            selected: 0,
+        };
+        let text = render_to_text(&mut app, 110, 40);
+        assert!(text.contains("Options"));
+        for tab in ["General", "Explorer", "Editor"] {
+            assert!(text.contains(tab), "tab {tab}");
+        }
+        assert!(text.contains("Theme"));
+        assert!(text.contains("Icons"));
+        assert!(text.contains("live preview"), "description of Theme");
+
+        app.overlay = Overlay::Options {
+            tab: 2,
+            selected: 0,
+        };
+        let text = render_to_text(&mut app, 110, 40);
+        assert!(text.contains("Edit inside runetui"));
+        assert!(text.contains("ON"));
+    }
+
+    #[test]
+    fn embedded_editor_is_drawn_in_the_document_pane() {
+        use crate::editor::EmbeddedEditor;
+        let dir = project();
+        let mut app = app(&dir);
+        let file = dir.path().join("other.rs");
+        let args = vec!["-c".to_string(), "sleep 5".to_string()];
+        let Ok(editor) = EmbeddedEditor::spawn_with("sh", &args, &file, 10, 40) else {
+            return; // no pty in this environment
+        };
+        app.editor = Some(editor);
+        app.focus = Focus::Viewer;
+        let text = render_to_text(&mut app, 110, 30);
+        assert!(text.contains(" EDIT "), "status badge");
+        assert!(text.contains(":wq"), "how to leave");
+        app.editor = None;
+    }
+
+    #[test]
+    fn outline_overlay_draws_headings() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.focus = Focus::Viewer;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Overlay::Outline { .. }));
+        let text = render_to_text(&mut app, 100, 30);
+        assert!(text.contains("Outline"));
+        assert!(text.contains("Section"));
+    }
+
+    #[test]
+    fn explorer_can_be_hidden() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.show_explorer = false;
+        app.set_terminal_area(Rect::new(0, 0, 100, 30));
+        let text = render_to_text(&mut app, 100, 30);
+        assert!(!text.contains("EXPLORER"));
+        // The document still renders across the full width.
+        assert!(text.contains("Welcome to the project."));
+    }
+
+    #[test]
+    fn theme_changes_are_reflected() {
+        let dir = project();
+        let mut app = app(&dir);
+        assert_eq!(app.theme, ThemeName::CatppuccinMocha);
+        app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE));
+        let text = render_to_text(&mut app, 100, 30);
+        assert!(text.contains("Tokyo Night"));
+    }
+
+    #[test]
+    fn tiny_terminal_does_not_panic() {
+        let dir = project();
+        let mut app = app(&dir);
+        for width in 1..30 {
+            for height in 1..12 {
+                let _ = render_to_text(&mut app, width, height);
+            }
+        }
+    }
+}

@@ -1,0 +1,28 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# The compiled `rtui` binary at the repository root is intentionally tracked:
+# this repository distributes the source and the binary together.
+# Uncomment the next line if you prefer binaries only via GitHub Releases.
+# /rtui
+
+# Packaged deliverables (the ZIP is for distribution, not for the repo)
+*.zip
+
+# Editor and OS noise
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local configuration and secrets
+.env
+.env.*
+config.toml
+
+# Rust tooling output
+*.profraw
