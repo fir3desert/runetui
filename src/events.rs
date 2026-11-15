@@ -33,6 +33,10 @@ pub const TERMINAL_TICK: Duration = Duration::from_millis(40);
 /// Poll interval while the menu banner animates (about 60 frames per second).
 pub const ANIMATION_TICK: Duration = Duration::from_millis(16);
 
+/// Poll interval while something runs in the background (a big directory
+/// listing), so the "indexing…" spinner turns and the result shows up promptly.
+pub const SPINNER_TICK: Duration = Duration::from_millis(80);
+
 /// Poll the terminal for one event, returning [`Event::Tick`] on timeout.
 pub fn next_event(timeout: Duration) -> Result<Event> {
     if !event::poll(timeout)? {

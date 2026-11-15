@@ -79,6 +79,7 @@ pub fn sections(keymap: &Keymap) -> Vec<HelpSection> {
                 entry(keymap, Action::HalfPageUp, "Scroll half a page up"),
                 fixed("PageUp / PageDown", "Scroll a page up / down"),
                 fixed("Enter", "Follow link, anchor or [[wikilink]]"),
+                entry(keymap, Action::FollowLink, "Follow the link on the line (http opens the browser)"),
                 entry(keymap, Action::Search, "Search in the document"),
                 entry(keymap, Action::SearchNext, "Next search match"),
                 entry(keymap, Action::SearchPrev, "Previous search match"),
@@ -125,6 +126,17 @@ pub fn rendered_line_count(keymap: &Keymap) -> usize {
         count += 1 + section.entries.len() + 1;
     }
     count
+}
+
+/// The whole help text, for tests.
+#[cfg(test)]
+pub fn rendered_text(keymap: &Keymap) -> String {
+    sections(keymap)
+        .into_iter()
+        .flat_map(|section| section.entries)
+        .map(|(keys, text)| format!("{keys} {text}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]

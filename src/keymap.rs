@@ -30,6 +30,7 @@ pub enum Action {
     Menu,
     Help,
     Outline,
+    FollowLink,
     Search,
     SearchNext,
     SearchPrev,
@@ -92,6 +93,13 @@ const META: &[Meta] = &[
         short: "outline",
         description: "Open the document outline",
         defaults: &["o"],
+    },
+    Meta {
+        action: Action::FollowLink,
+        name: "follow_link",
+        short: "follow link",
+        description: "Follow the link on the current line (Space also opens files in the explorer)",
+        defaults: &["space"],
     },
     Meta {
         action: Action::Search,

@@ -31,6 +31,7 @@ pub struct RenderedDoc {
 impl RenderedDoc {
     /// Link (if any) located on `line`.  The first link wins; that matches the
     /// "press Enter on the current line" interaction.
+    #[cfg(test)]
     pub fn link_at(&self, line: usize) -> Option<&DocLink> {
         self.links
             .iter()

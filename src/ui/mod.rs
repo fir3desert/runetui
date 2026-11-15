@@ -24,6 +24,8 @@ use crate::app::{App, Focus};
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.set_terminal_area(area);
+    app.star_rect.set(None);
+    app.hits.borrow_mut().clear();
     let theme = app.theme();
 
     frame.render_widget(Block::default().style(theme.base()), area);
@@ -65,6 +67,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     statusbar::render(frame, app.layout.status, app);
     overlays::render(frame, area, app);
+}
+
+/// Draw one frame to text, for tests in other modules.
+#[cfg(test)]
+pub fn render_to_text_for_test(app: &mut App, width: u16, height: u16) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| draw(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            out.push_str(buffer[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -668,19 +688,152 @@ mod tests {
     }
 
     #[test]
-    fn the_header_always_shows_the_stars_left_of_the_document_kind() {
+    fn the_header_shows_kind_then_progress_then_the_stars_at_the_far_right() {
         let dir = project();
         let mut app = app(&dir);
         app.stars.set_for_test(crate::stars::StarsState::Count(1234));
         for width in [80u16, 120, 209] {
             let top = header_row(&mut app, width);
-            let star = top.find('★').expect("stars in the header");
-            assert!(top[star..].contains("★ 1.2k"), "{top:?}");
             let kind = app.viewer.kind_label.clone();
-            let after = &top[star + "★ 1.2k".len()..];
-            assert!(after.contains(kind.as_str()), "kind badge after the stars: {top:?}");
-            assert!(after.trim_end().ends_with('%') || after.trim_end().ends_with('—'), "{top:?}");
+            let kind_at = top.find(kind.as_str()).expect("kind badge");
+            let star = top.find('★').expect("stars in the header");
+            assert!(kind_at < star, "kind before stars: {top:?}");
+            let between = &top[kind_at + kind.len()..star];
+            assert!(between.contains('%') || between.contains('—'), "progress between: {top:?}");
+            assert!(top.trim_end().ends_with("★ 1.2k"), "stars last: {top:?}");
+            // One blank column of margin after the stars, as before.
+            assert!(top.ends_with("★ 1.2k "), "{top:?}");
         }
+    }
+
+    #[test]
+    fn the_header_records_where_the_stars_are_for_clicks() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.stars.set_for_test(crate::stars::StarsState::Count(42));
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rect = app.star_rect.get().expect("rect recorded");
+        let buffer = terminal.backend().buffer();
+        let drawn: String = (rect.x..rect.x + rect.width).map(|x| buffer[(x, rect.y)].symbol()).collect();
+        assert_eq!(drawn, "★ 42");
+        assert_eq!(rect.y, 0);
+
+        // No stars, no rectangle.
+        app.config.show_stars = false;
+        app.stars.set_enabled(false);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.star_rect.get().is_none());
+    }
+
+    #[test]
+    fn the_menu_records_its_own_star_rectangle() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.stars.set_for_test(crate::stars::StarsState::Count(42));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.finish_menu_animation();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rect = app.star_rect.get().expect("menu rect");
+        let buffer = terminal.backend().buffer();
+        let drawn: String = (rect.x..rect.x + rect.width).map(|x| buffer[(x, rect.y)].symbol()).collect();
+        assert_eq!(drawn, "★ 42");
+    }
+
+    thread_local! {
+        static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn opener_ok(url: &str) -> Result<(), String> {
+        OPENED.with(|log| log.borrow_mut().push(url.to_string()));
+        Ok(())
+    }
+    fn opener_missing(url: &str) -> Result<(), String> {
+        OPENED.with(|log| log.borrow_mut().push(url.to_string()));
+        Err("xdg-open exited with 3".to_string())
+    }
+    fn click(app: &mut App, x: u16, y: u16) {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    fn draw_once(app: &mut App) {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+    }
+
+    #[test]
+    fn clicking_the_header_stars_opens_the_repository() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.opener = opener_ok;
+        OPENED.with(|log| log.borrow_mut().clear());
+        app.stars.set_for_test(crate::stars::StarsState::Count(42));
+        draw_once(&mut app);
+        let rect = app.star_rect.get().unwrap();
+        click(&mut app, rect.x + 1, rect.y);
+        OPENED.with(|log| assert_eq!(*log.borrow(), vec![crate::stars::REPO_URL.to_string()]));
+        assert!(app.status_text().is_some_and(|text| text.contains("Opened")));
+
+        // Elsewhere on the header, or just beside the label: nothing.
+        OPENED.with(|log| log.borrow_mut().clear());
+        click(&mut app, 2, 0);
+        click(&mut app, rect.x - 1, 0);
+        click(&mut app, rect.x + rect.width, 0);
+        OPENED.with(|log| assert!(log.borrow().is_empty()));
+    }
+
+    #[test]
+    fn clicking_the_menu_stars_opens_the_repository_and_keeps_the_menu() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.opener = opener_ok;
+        OPENED.with(|log| log.borrow_mut().clear());
+        app.stars.set_for_test(crate::stars::StarsState::Count(42));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.finish_menu_animation();
+        draw_once(&mut app);
+        let rect = app.star_rect.get().unwrap();
+        click(&mut app, rect.x, rect.y);
+        OPENED.with(|log| assert_eq!(log.borrow().len(), 1));
+        assert!(matches!(app.overlay, crate::app::Overlay::Menu { .. }));
+    }
+
+    #[test]
+    fn without_a_browser_the_address_is_copied_and_the_status_says_so() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.opener = opener_missing;
+        app.stars.set_for_test(crate::stars::StarsState::Count(42));
+        draw_once(&mut app);
+        let rect = app.star_rect.get().unwrap();
+        click(&mut app, rect.x, rect.y);
+        let text = app.take_clipboard().expect("address copied");
+        assert_eq!(text, crate::stars::REPO_URL);
+        let message = app.copy_status(&text);
+        assert!(message.contains("No browser") && message.contains(crate::stars::REPO_URL), "{message}");
+        // The next ordinary copy reports itself again.
+        assert_eq!(app.copy_status("abc"), "Copied 3 characters");
+    }
+
+    #[test]
+    fn with_mouse_off_the_stars_are_not_clickable() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.opener = opener_ok;
+        OPENED.with(|log| log.borrow_mut().clear());
+        app.stars.set_for_test(crate::stars::StarsState::Count(42));
+        app.config.mouse = false;
+        draw_once(&mut app);
+        let rect = app.star_rect.get().unwrap();
+        click(&mut app, rect.x, rect.y);
+        OPENED.with(|log| assert!(log.borrow().is_empty()));
     }
 
     #[test]

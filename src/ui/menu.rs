@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, MENU_ITEMS, OPTION_TABS, OptionItem};
+use crate::app::{App, Hit, MENU_ITEMS, OPTION_TABS, OptionItem};
 use crate::editor::{editor_command, shell_command};
 use crate::keymap::Action;
 use crate::ui::themes::{Theme, ThemeName};
@@ -310,9 +310,9 @@ pub fn render_menu(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
     let banner_w = banner_width();
     let needed_height = 11 + 3 * 4;
     if area.width >= banner_w + 4 && area.height >= needed_height {
-        render_big_menu(frame, area, &theme, selected, banner_w, app.menu_animation());
+        render_big_menu(frame, area, app, &theme, selected, banner_w, app.menu_animation());
     } else {
-        render_compact_menu(frame, area, &theme, selected);
+        render_compact_menu(frame, area, app, &theme, selected);
     }
     draw_corners(frame, area, app, &theme);
 }
@@ -329,6 +329,12 @@ fn draw_corners(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if let Some(text) = crate::stars::label(app.stars.state()) {
         let width = UnicodeWidthStr::width(text.as_str()) as u16;
         if width + 3 <= area.width {
+            app.star_rect.set(Some(Rect::new(
+                area.right() - width - 1,
+                area.y,
+                width,
+                1,
+            )));
             // A leading blank keeps it apart from the header text.
             put_corner(
                 frame,
@@ -455,6 +461,7 @@ fn draw_banner(
 fn render_big_menu(
     frame: &mut Frame,
     area: Rect,
+    app: &App,
     theme: &Theme,
     selected: usize,
     banner_w: u16,
@@ -479,7 +486,10 @@ fn render_big_menu(
         } else {
             Style::default().fg(theme.fg_dim)
         };
-        let _ = width;
+        app.record_hit(
+            Rect::new(x, y, width, 3).intersection(area),
+            Hit::MenuItem(index),
+        );
         for (offset, row) in rows.into_iter().enumerate() {
             put_text(frame, x, y + offset as u16, &row, style);
         }
@@ -489,7 +499,7 @@ fn render_big_menu(
     hint(frame, area, theme, MENU_HINT);
 }
 
-fn render_compact_menu(frame: &mut Frame, area: Rect, theme: &Theme, selected: usize) {
+fn render_compact_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, selected: usize) {
     let width = 26u16.min(area.width);
     let height = 7u16.min(area.height);
     let rect = Rect::new(
@@ -519,6 +529,7 @@ fn render_compact_menu(frame: &mut Frame, area: Rect, theme: &Theme, selected: u
             Style::default().fg(theme.fg_dim)
         };
         let text = format!("{} {label:<width$}", if is_selected { "❯" } else { " " }, width = inner.width as usize - 2);
+        app.record_hit(Rect::new(inner.x, row, inner.width, 1), Hit::MenuItem(index));
         put(frame, inner.x, row, inner.width, text, style);
     }
 }
@@ -733,10 +744,15 @@ pub fn render_options(frame: &mut Frame, area: Rect, app: &App, tab: usize, sele
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
+    app.record_hit(rect, Hit::Panel);
 
     // Tabs.
     let mut spans = vec![Span::raw(" ")];
+    let mut tab_x = inner.x + 1;
     for (index, entry) in OPTION_TABS.iter().enumerate() {
+        let tab_w = UnicodeWidthStr::width(entry.name) as u16 + 2;
+        app.record_hit(Rect::new(tab_x, inner.y, tab_w, 1).intersection(inner), Hit::OptionsTab(index));
+        tab_x += tab_w + 1;
         let style = if index == tab {
             Style::default()
                 .fg(theme.bg)
@@ -799,6 +815,12 @@ pub fn render_options(frame: &mut Frame, area: Rect, app: &App, tab: usize, sele
         let value_w = UnicodeWidthStr::width(text.value.as_str());
         let used = 2 + UnicodeWidthStr::width(text.label) + value_w;
         let gap = label_w.saturating_sub(used + 1).max(1);
+        app.record_hit(Rect::new(list.x, row, list.width, 1), Hit::Option(index));
+        let value_x = list.x + (2 + UnicodeWidthStr::width(text.label) + gap) as u16;
+        app.record_hit(
+            Rect::new(value_x, row, value_w as u16, 1).intersection(list),
+            Hit::OptionValue(index),
+        );
         let line = Line::from(vec![
             Span::styled(format!("{marker}{}", text.label), style),
             Span::styled(" ".repeat(gap), style),
@@ -867,7 +889,7 @@ pub fn render_themes(frame: &mut Frame, area: Rect, app: &App, selected: usize) 
     // Banner (8) + version row + gap + list + gap + title.
     let needed = 8 + 1 + 2 + count + 2;
     if area.width < banner_w + 4 || area.height < needed + 1 {
-        render_themes_compact(frame, area, &theme, selected);
+        render_themes_compact(frame, area, app, &theme, selected);
         return;
     }
 
@@ -902,12 +924,13 @@ pub fn render_themes(frame: &mut Frame, area: Rect, app: &App, selected: usize) 
             ("■ ".to_string(), Style::default().fg(palette.yellow)),
             ("■".to_string(), Style::default().fg(palette.red)),
         ];
+        app.record_hit(Rect::new(x, top + 12 + index as u16, row_w, 1).intersection(area), Hit::Theme(index));
         put_sparse(frame, x, top + 12 + index as u16, &runs);
     }
     hint(frame, area, &theme, " ↑ / ↓ preview · Enter apply · Esc cancel ");
 }
 
-fn render_themes_compact(frame: &mut Frame, area: Rect, theme: &Theme, selected: usize) {
+fn render_themes_compact(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, selected: usize) {
     if area.width < 24 || area.height < 6 {
         return;
     }
@@ -924,6 +947,7 @@ fn render_themes_compact(frame: &mut Frame, area: Rect, theme: &Theme, selected:
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
+    app.record_hit(rect, Hit::Panel);
     let visible = inner.height as usize;
     let offset = selected.saturating_sub(visible.saturating_sub(1));
     for (row, (index, name)) in ThemeName::ALL.iter().enumerate().skip(offset).take(visible).enumerate() {
@@ -934,6 +958,7 @@ fn render_themes_compact(frame: &mut Frame, area: Rect, theme: &Theme, selected:
             Style::default().fg(theme.fg_dim)
         };
         let text = format!("{} {:<w$}", if is_selected { "❯" } else { " " }, name.label(), w = inner.width as usize - 2);
+        app.record_hit(Rect::new(inner.x, inner.y + row as u16, inner.width, 1), Hit::Theme(index));
         put(frame, inner.x, inner.y + row as u16, inner.width, text, style);
     }
 }

@@ -2,8 +2,8 @@
 //!
 //! The project name and path are shown once, in the explorer and the status
 //! bar, so the header stays short: the app badge, the heading under the
-//! cursor, the GitHub star count, the kind of document and how far down it
-//! you are.
+//! cursor, the kind of document, how far down it you are and, at the far right, the
+//! GitHub star count (a click on it opens the repository).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -40,21 +40,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         "—".to_string()
     };
 
-    let mut right = Vec::new();
-    // The star count sits left of the document kind.  It is the first item
-    // dropped when the bar runs out of room, and the Esc menu draws its own
-    // copy in the same corner, so the header leaves it out then.
-    if !matches!(app.overlay, Overlay::Menu { .. }) {
-        if let Some(label) = crate::stars::label(app.stars.state()) {
-            right.push(Span::styled(
-                format!(" {label} "),
-                Style::default()
-                    .fg(crate::ui::menu::STAR_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-    }
-    right.extend([
+    // Kind, progress, then the star count at the far right.  The stars are the
+    // first thing dropped when the bar runs out of room, then the kind.  The
+    // Esc menu draws its own copy in the same corner, so the header leaves it
+    // out then.
+    let mut right = vec![
         Span::styled(
             format!(" {} ", app.viewer.kind_label),
             Style::default()
@@ -63,10 +53,31 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(format!("{position} "), theme.muted()),
-    ]);
+        Span::styled(position, theme.muted()),
+    ];
+    let stars_label = if matches!(app.overlay, Overlay::Menu { .. }) {
+        None
+    } else {
+        crate::stars::label(app.stars.state())
+    };
+    if let Some(label) = &stars_label {
+        right.push(Span::styled(
+            format!("  {label}"),
+            Style::default()
+                .fg(crate::ui::menu::STAR_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
-    let line = bar::build(left, right, area.width);
+    let built = bar::build_ordered(left, right, Span::raw(" "), area.width, &[3, 0, 1, 2]);
+    // The label itself (not its leading blanks) is what a click hits.
+    if stars_label.is_some() {
+        if let Some(Some((offset, width))) = built.right_at.get(3) {
+            app.star_rect
+                .set(Some(Rect::new(area.x + offset + 2, area.y, width - 2, 1)));
+        }
+    }
+    let line = built.line;
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(theme.bg_alt).fg(theme.fg_dim)),
         area,

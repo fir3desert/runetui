@@ -13,7 +13,7 @@ pub const MIN_WIDTH_PCT: u16 = 14;
 pub const MAX_WIDTH_PCT: u16 = 60;
 pub const DEFAULT_WIDTH_PCT: u16 = 28;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Explorer {
     pub tree: FileTree,
     visible: Vec<usize>,
@@ -21,6 +21,8 @@ pub struct Explorer {
     offset: usize,
     width_pct: u16,
     viewport_height: usize,
+    /// A file to reveal as soon as the folders on its way finish loading.
+    reveal_pending: Option<PathBuf>,
 }
 
 impl Explorer {
@@ -32,6 +34,23 @@ impl Explorer {
             offset: 0,
             width_pct: width_pct.clamp(MIN_WIDTH_PCT, MAX_WIDTH_PCT),
             viewport_height: 20,
+            reveal_pending: None,
+        };
+        explorer.rebuild_visible();
+        explorer
+    }
+
+    /// An explorer over an existing tree (to test slow listings).
+    #[cfg(test)]
+    pub fn from_tree(tree: FileTree) -> Self {
+        let mut explorer = Self {
+            tree,
+            visible: Vec::new(),
+            selected: 0,
+            offset: 0,
+            width_pct: DEFAULT_WIDTH_PCT,
+            viewport_height: 20,
+            reveal_pending: None,
         };
         explorer.rebuild_visible();
         explorer
@@ -116,6 +135,8 @@ impl Explorer {
         self.ensure_visible();
     }
 
+    /// List every folder that has been read again.  Slow folders finish in the
+    /// background; see [`Explorer::poll`].
     pub fn refresh(&mut self) {
         let selected_path = self.selected_path();
         self.tree.refresh();
@@ -123,6 +144,33 @@ impl Explorer {
         if let Some(path) = selected_path {
             self.select_path(&path);
         }
+    }
+
+    /// List only the folders in `dirs` again (the ones a filesystem event
+    /// touched).
+    pub fn refresh_dirs(&mut self, dirs: &[PathBuf]) {
+        self.tree.refresh_dirs(dirs);
+        self.rebuild_visible();
+    }
+
+    /// Apply background listings that have finished.  Returns `true` when the
+    /// tree changed.
+    pub fn poll(&mut self) -> bool {
+        if !self.tree.poll() {
+            return false;
+        }
+        self.rebuild_visible();
+        if let Some(path) = self.reveal_pending.clone() {
+            if self.select_path(&path) || self.tree.pending() == 0 {
+                self.reveal_pending = None;
+            }
+        }
+        true
+    }
+
+    /// When the current background work started.
+    pub fn busy_since(&self) -> Option<std::time::Instant> {
+        self.tree.busy_since()
     }
 
     pub fn set_show_hidden(&mut self, show_hidden: bool) {
@@ -160,6 +208,7 @@ impl Explorer {
     // -------------------------------------------------------------- selection
 
     pub fn select_position(&mut self, position: usize) {
+        self.reveal_pending = None;
         if self.visible.is_empty() {
             self.selected = 0;
             self.offset = 0;
@@ -172,8 +221,12 @@ impl Explorer {
     /// Select `path`, expanding its ancestors when needed.
     pub fn select_path(&mut self, path: &Path) -> bool {
         let Some(index) = self.tree.reveal_path(path) else {
+            // A folder on the way is still loading: finish when it arrives.
+            self.reveal_pending = (self.tree.pending() > 0).then(|| path.to_path_buf());
+            self.rebuild_visible();
             return false;
         };
+        self.reveal_pending = None;
         self.visible = self.tree.visible();
         match self
             .visible
@@ -205,6 +258,7 @@ impl Explorer {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
+        self.reveal_pending = None;
         if self.visible.is_empty() {
             return;
         }
@@ -536,5 +590,70 @@ mod tests {
         assert!(explorer.selected_position() < explorer.offset() + 5);
         explorer.go_top();
         assert_eq!(explorer.offset(), 0);
+    }
+
+    fn settle(explorer: &mut Explorer, done: impl Fn(&Explorer) -> bool) {
+        let started = std::time::Instant::now();
+        while !done(explorer) {
+            explorer.poll();
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "never settled");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_slow_root_leaves_a_usable_explorer_and_selects_the_file_when_it_arrives() {
+        let dir = project();
+        let tree = FileTree::new_slow(
+            dir.path(),
+            false,
+            false,
+            std::time::Duration::from_millis(120),
+            std::time::Duration::ZERO,
+        );
+        let mut explorer = Explorer::from_tree(tree);
+        assert_eq!(explorer.visible_len(), 1, "just the root for now");
+
+        let target = dir.path().join("docs/guide.md");
+        assert!(!explorer.select_path(&target), "cannot be selected yet");
+        assert!(explorer.reveal_pending.is_some());
+
+        // Each arriving folder moves the reveal one level further.
+        settle(&mut explorer, |explorer| explorer.selected_path().as_deref() == Some(target.as_path()));
+        assert!(explorer.reveal_pending.is_none());
+        assert_eq!(explorer.tree.pending(), 0);
+    }
+
+    #[test]
+    fn moving_the_selection_cancels_a_pending_reveal() {
+        let dir = project();
+        let tree = FileTree::new_slow(
+            dir.path(),
+            false,
+            false,
+            std::time::Duration::from_millis(120),
+            std::time::Duration::ZERO,
+        );
+        let mut explorer = Explorer::from_tree(tree);
+        explorer.select_path(&dir.path().join("docs/guide.md"));
+        assert!(explorer.reveal_pending.is_some());
+        explorer.move_selection(1);
+        assert!(explorer.reveal_pending.is_none());
+        settle(&mut explorer, |explorer| explorer.tree.pending() == 0);
+        // The user's own movement was not overridden.
+        assert_ne!(explorer.selected_path().as_deref(), Some(dir.path().join("docs/guide.md").as_path()));
+    }
+
+    #[test]
+    fn refreshing_only_the_named_folders_keeps_the_selection() {
+        let (dir, mut explorer) = explorer();
+        explorer.select_path(&dir.path().join("docs/guide.md"));
+        fs::write(dir.path().join("docs/new.md"), b"x\n").unwrap();
+        explorer.refresh_dirs(&[dir.path().join("docs")]);
+        assert_eq!(
+            explorer.selected_path().as_deref(),
+            Some(dir.path().join("docs/guide.md").as_path())
+        );
+        assert!(explorer.tree.find_path(&dir.path().join("docs/new.md")).is_some());
     }
 }

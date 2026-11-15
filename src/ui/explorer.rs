@@ -52,6 +52,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Columns, relative to the row's left edge, taken by the chevron of a folder:
+/// `(start, width)`.  The root and files have none.
+pub fn chevron_columns(node: &FileNode, style: IconStyle) -> Option<(u16, u16)> {
+    use unicode_width::UnicodeWidthStr;
+    if !node.is_dir || node.depth == 0 {
+        return None;
+    }
+    // The selection bar, then 2 blanks for the first level and a guide for each
+    // deeper one.
+    let mut start = 1usize;
+    for level in 0..node.depth {
+        start += if level == 0 { 2 } else { UnicodeWidthStr::width(style.guide()) };
+    }
+    let width = UnicodeWidthStr::width(style.chevron(node.expanded));
+    Some((start as u16, width as u16))
+}
+
 fn node_line(
     node: &FileNode,
     theme: &Theme,
@@ -129,6 +146,9 @@ fn node_line(
     };
     spans.push(Span::styled(node.name.clone(), name_style));
 
+    if node.loading {
+        spans.push(Span::styled(" …", Style::default().fg(theme.yellow)));
+    }
     if is_active {
         spans.push(Span::styled(" ●", Style::default().fg(theme.green)));
     }

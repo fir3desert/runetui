@@ -112,7 +112,39 @@ impl LoadedDoc {
     }
 
     pub fn badge(&self) -> String {
-        self.kind.badge().to_string()
+        match self.kind {
+            DocKind::Text => text_badge(&self.path),
+            _ => self.kind.badge().to_string(),
+        }
+    }
+}
+
+/// Badge of a plain-text document.  A bare "text" next to a name such as
+/// `.gitignore` reads like an extension, so say what the file is: "text" for
+/// `.txt`, otherwise the extension (`text · .rst`) or the whole name
+/// (`text · .gitignore`, `text · LICENSE`).
+fn text_badge(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let short = |text: &str| -> String {
+        if text.chars().count() > 24 {
+            format!("{}…", text.chars().take(23).collect::<String>())
+        } else {
+            text.to_string()
+        }
+    };
+    if name.is_empty() {
+        return "text".to_string();
+    }
+    if name.starts_with('.') {
+        return format!("text · {}", short(&name));
+    }
+    match path.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase()) {
+        Some(ext) if ext == "txt" || ext == "text" => "text".to_string(),
+        Some(ext) => format!("text · .{}", short(&ext)),
+        None => format!("text · {}", short(&name)),
     }
 }
 
@@ -200,6 +232,24 @@ pub fn load_document(path: &Path) -> Result<LoadedDoc> {
                         kind: DocKind::Code(lang.to_string()),
                         content: ParsedContent::Code {
                             lang: lang.to_string(),
+                            lines: split_lines(&source),
+                        },
+                        bytes,
+                    });
+                }
+            }
+            // A well-known name (`Makefile`) that syntect has a syntax for.
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !file_name.starts_with('.') {
+                if let Some(token) = crate::markdown::code_highlighter::syntax_token_for_file_name(&file_name) {
+                    return Ok(LoadedDoc {
+                        path: path.to_path_buf(),
+                        kind: DocKind::Code(token.clone()),
+                        content: ParsedContent::Code {
+                            lang: token,
                             lines: split_lines(&source),
                         },
                         bytes,
@@ -426,7 +476,7 @@ impl Default for Viewer {
             rendered_theme: None,
             search: None,
             title: "Welcome".to_string(),
-            kind_label: "home".to_string(),
+            kind_label: "welcome".to_string(),
             welcome_source: None,
             lazy: None,
         }
@@ -503,7 +553,7 @@ impl Viewer {
         self.lazy = None;
         self.doc = renderer::render(&blocks, width, theme, highlighter);
         self.title = "Welcome".to_string();
-        self.kind_label = "home".to_string();
+        self.kind_label = "welcome".to_string();
         self.cursor = 0;
         self.top = 0;
         self.rendered_width = width;
@@ -1131,5 +1181,62 @@ mod tests {
             "{} lines: first chunk {first:?}, remaining chunks {rest:?}, whole file at once {whole:?}",
             lines.len()
         );
+    }
+
+    // ------------------------------------------------------------ type badge
+
+    fn badge_of(name: &str, contents: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        load_document(&path).unwrap().badge()
+    }
+
+    #[test]
+    fn plain_text_says_which_file_it_is_instead_of_looking_like_an_extension() {
+        assert_eq!(badge_of(".gitignore", "target/\n"), "text · .gitignore");
+        assert_eq!(badge_of(".env", "A=1\n"), "text · .env");
+        assert_eq!(badge_of("LICENSE", "MIT\n"), "text · LICENSE");
+        assert_eq!(badge_of("Dockerfile", "FROM x\n"), "text · Dockerfile");
+        assert_eq!(badge_of("notes.txt", "hi\n"), "text");
+        assert_eq!(badge_of("readme.text", "hi\n"), "text");
+        assert_eq!(badge_of("manual.rst", "hi\n"), "text · .rst");
+        assert_eq!(badge_of("server.LOG", "hi\n"), "text · .log");
+    }
+
+    #[test]
+    fn long_names_are_cut_in_the_badge() {
+        let name = format!("{}", "a".repeat(40));
+        let badge = badge_of(&name, "hi\n");
+        assert!(badge.starts_with("text · "));
+        assert!(badge.ends_with('…'));
+        assert!(badge.chars().count() < 40);
+    }
+
+    #[test]
+    fn well_known_names_with_a_syntect_syntax_are_code_not_plain_text() {
+        // syntect ships a Makefile syntax…
+        assert_eq!(badge_of("Makefile", "all:\n\techo hi\n"), "makefile");
+        // …but none for these, which therefore stay plain text.
+        for name in [".gitignore", "Dockerfile", "LICENSE", ".editorconfig"] {
+            assert!(
+                crate::markdown::code_highlighter::syntax_token_for_file_name(name).is_none(),
+                "{name} unexpectedly has a syntax"
+            );
+        }
+        assert!(crate::markdown::code_highlighter::syntax_token_for_file_name("Makefile").is_some());
+        assert!(crate::markdown::code_highlighter::syntax_token_for_file_name("").is_none());
+    }
+
+    #[test]
+    fn dotfiles_are_never_looked_up_as_syntaxes() {
+        // `.sh` as a file name must not be mistaken for the `sh` extension.
+        assert_eq!(badge_of(".sh", "echo hi\n"), "text · .sh");
+    }
+
+    #[test]
+    fn the_empty_viewer_is_labelled_welcome_not_home() {
+        let viewer = Viewer::default();
+        assert_eq!(viewer.kind_label, "welcome");
     }
 }

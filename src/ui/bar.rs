@@ -44,6 +44,78 @@ pub fn build(
     Line::from(left)
 }
 
+/// A composed bar and where each right-hand item ended up.
+pub struct Built {
+    pub line: Line<'static>,
+    /// For every item of `right`: `(offset from the bar's left edge, width)`,
+    /// or `None` when it was dropped.
+    pub right_at: Vec<Option<(u16, u16)>>,
+}
+
+/// Like [`build`], but the right-hand items are shown in the order given and
+/// are dropped in `drop_order` (indexes into `right`) when space runs out.
+/// `tail` is always kept after them unless nothing fits at all.
+pub fn build_ordered(
+    mut left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    tail: Span<'static>,
+    width: u16,
+    drop_order: &[usize],
+) -> Built {
+    let width = width as usize;
+    let left_width = width_of(&left);
+    let tail_width = span_width(&tail);
+    let mut keep = vec![true; right.len()];
+    let group_width = |keep: &[bool]| -> usize {
+        right
+            .iter()
+            .zip(keep)
+            .filter(|(_, kept)| **kept)
+            .map(|(span, _)| span_width(span))
+            .sum::<usize>()
+            + tail_width
+    };
+
+    for &index in drop_order {
+        if left_width + group_width(&keep) + 1 <= width {
+            break;
+        }
+        if let Some(kept) = keep.get_mut(index) {
+            *kept = false;
+        }
+    }
+    let mut use_tail = true;
+    if left_width + group_width(&keep) + 1 > width {
+        // Not even the tail fits next to the left side: show only the left.
+        keep.iter_mut().for_each(|kept| *kept = false);
+        use_tail = false;
+    }
+
+    let right_width = if use_tail { group_width(&keep) } else { 0 };
+    let gap = width.saturating_sub(left_width + right_width);
+    let mut cursor = left_width + gap;
+    let mut right_at = vec![None; right.len()];
+    if gap > 0 {
+        left.push(Span::raw(" ".repeat(gap)));
+    }
+    for (index, span) in right.into_iter().enumerate() {
+        if !keep[index] {
+            continue;
+        }
+        let span_w = span_width(&span);
+        right_at[index] = Some((cursor as u16, span_w as u16));
+        cursor += span_w;
+        left.push(span);
+    }
+    if use_tail {
+        left.push(tail);
+    }
+    Built {
+        line: Line::from(left),
+        right_at,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +151,36 @@ mod tests {
             8,
         );
         assert_eq!(text(&line), "abc  two");
+    }
+
+    #[test]
+    fn ordered_build_drops_in_the_given_order_and_reports_positions() {
+        let right = || {
+            vec![
+                Span::raw("kind"),
+                Span::raw(" "),
+                Span::raw("0%"),
+                Span::raw(" ★ 5"),
+            ]
+        };
+        let order = [3, 0, 1, 2];
+        // Plenty of room: everything shows, stars last.
+        let built = build_ordered(vec![Span::raw("ab")], right(), Span::raw(" "), 20, &order);
+        assert_eq!(text(&built.line), format!("ab{}kind 0% ★ 5 ", " ".repeat(6)));
+        let star = built.right_at[3].unwrap();
+        assert_eq!(star.1, 4);
+        assert_eq!(star.0 + star.1 + 1, 20, "the tail margin follows the stars");
+
+        // Tight: the stars go first, then the kind.
+        let built = build_ordered(vec![Span::raw("ab")], right(), Span::raw(" "), 12, &order);
+        assert!(built.right_at[3].is_none());
+        assert!(built.right_at[0].is_some());
+        let built = build_ordered(vec![Span::raw("ab")], right(), Span::raw(" "), 7, &order);
+        assert!(built.right_at[3].is_none() && built.right_at[0].is_none());
+        assert!(built.right_at[2].is_some());
+        // Hopeless: only the left side.
+        let built = build_ordered(vec![Span::raw("abcdef")], right(), Span::raw(" "), 6, &order);
+        assert!(built.right_at.iter().all(Option::is_none));
+        assert_eq!(text(&built.line).trim_end(), "abcdef");
     }
 }

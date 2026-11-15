@@ -47,6 +47,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     )];
 
+    if app.indexing() {
+        left.push(Span::styled(
+            format!(" {} indexing…", app.spinner()),
+            Style::default().fg(theme.yellow),
+        ));
+    }
+
     if let Some(first) = pending {
         // Waiting for the second key of a sequence: list what it can be.
         let options = app
@@ -105,6 +112,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let mut right = Vec::new();
+    if app.watcher_problem().is_some() {
+        right.push(Span::styled(
+            " no live refresh ",
+            Style::default().fg(theme.orange),
+        ));
+    }
     if app.explorer.show_hidden() {
         right.push(Span::styled(" hidden ", Style::default().fg(theme.yellow)));
     }

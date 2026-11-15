@@ -16,6 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Repository whose stars are shown.
 pub const REPO: &str = "fir3desert/runetui";
+/// Where clicking the stars goes.
+pub const REPO_URL: &str = "https://github.com/fir3desert/runetui";
 /// How long a cached count is trusted before asking GitHub again.
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 

@@ -26,8 +26,11 @@ pub const DEFAULT_ICONS: &str = "unicode";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Project directory opened last time, used for the bare `rtui` command.
+    /// Project directory opened last time; only used by the bare `rtui`
+    /// command when `reopen_last_directory` is on.
     pub last_directory: Option<PathBuf>,
+    /// Bare `rtui` reopens `last_directory` instead of the current directory.
+    pub reopen_last_directory: bool,
     /// Theme slug, e.g. `catppuccin-mocha`.
     pub theme: String,
     /// Explorer icon style: `nerd`, `unicode` or `ascii`.
@@ -62,6 +65,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             last_directory: None,
+            reopen_last_directory: false,
             theme: DEFAULT_THEME.to_string(),
             icons: DEFAULT_ICONS.to_string(),
             show_hidden: false,
@@ -193,8 +197,8 @@ pub fn resolve_root(cli_path: Option<&Path>, config: &Config) -> PathBuf {
             }
         }
     }
-    if let Some(directory) = &config.last_directory {
-        if directory.is_dir() {
+    if config.reopen_last_directory {
+        if let Some(directory) = config.last_directory.as_ref().filter(|dir| dir.is_dir()) {
             return directory.clone();
         }
     }
@@ -325,5 +329,27 @@ mod tests {
             resolve_root(Some(dir.path()), &config),
             dir.path().to_path_buf()
         );
+    }
+
+    #[test]
+    fn a_bare_command_opens_the_current_directory_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.last_directory = Some(dir.path().to_path_buf());
+        assert_eq!(resolve_root(None, &config), std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn a_bare_command_can_reopen_the_last_directory_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.last_directory = Some(dir.path().to_path_buf());
+        config.reopen_last_directory = true;
+        assert_eq!(resolve_root(None, &config), dir.path());
+        // An explicit path still wins.
+        assert_eq!(resolve_root(Some(dir.path()), &config), dir.path());
+        // A vanished directory falls back to the current one.
+        config.last_directory = Some(dir.path().join("gone"));
+        assert_eq!(resolve_root(None, &config), std::env::current_dir().unwrap());
     }
 }

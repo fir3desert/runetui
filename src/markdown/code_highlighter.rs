@@ -210,6 +210,23 @@ impl CodeHighlighter {
     }
 }
 
+/// The syntect syntax token for a file known by its whole name (`Makefile`),
+/// if the bundled syntaxes have one.  `None` means syntect would only offer
+/// plain text, so the file is not code as far as this program can tell.
+pub fn syntax_token_for_file_name(name: &str) -> Option<String> {
+    use std::sync::OnceLock;
+    static SET: OnceLock<SyntaxSet> = OnceLock::new();
+    let set = SET.get_or_init(SyntaxSet::load_defaults_nonewlines);
+    let token = name.trim().to_ascii_lowercase();
+    if token.is_empty() {
+        return None;
+    }
+    set.find_syntax_by_token(&token)
+        .or_else(|| set.find_syntax_by_extension(&token))
+        .filter(|syntax| syntax.name != "Plain Text")
+        .map(|_| token)
+}
+
 impl Default for CodeHighlighter {
     fn default() -> Self {
         Self::new()

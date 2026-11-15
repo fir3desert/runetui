@@ -6,7 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::app::{App, Overlay};
+use crate::app::{App, Hit, Overlay};
 use crate::ui::help;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
@@ -14,6 +14,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Overlay::None => {}
         Overlay::Help { scroll } => render_help(frame, area, app, scroll),
         Overlay::Outline { selected } => render_outline(frame, area, app, selected),
+        Overlay::Links { selected } => render_links(frame, area, app, selected),
         Overlay::Themes { selected, .. } => {
             crate::ui::menu::render_themes(frame, area, app, selected);
         }
@@ -107,6 +108,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, scroll: usize) {
 
     frame.render_widget(Clear, rect);
     frame.render_widget(paragraph, rect);
+    app.record_hit(rect, Hit::Panel);
 }
 
 fn render_outline(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
@@ -127,6 +129,10 @@ fn render_outline(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_height);
     for (index, item) in outline.iter().enumerate().skip(offset).take(inner_height) {
         let is_selected = index == selected;
+        app.record_hit(
+            Rect::new(rect.x + 1, rect.y + 1 + lines.len() as u16, rect.width.saturating_sub(2), 1),
+            Hit::Outline(index),
+        );
         let indent = "  ".repeat(item.level.saturating_sub(1) as usize);
         let marker = if is_selected { "▍ " } else { "  " };
         let mut line = Line::from(vec![
@@ -160,4 +166,72 @@ fn render_outline(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
 
     frame.render_widget(Clear, rect);
     frame.render_widget(paragraph, rect);
+    app.record_hit(rect, Hit::Panel);
+}
+
+/// Chooser for a line with several links: number, label and target.
+fn render_links(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
+    if area.width < 24 || area.height < 6 || app.link_choices.is_empty() {
+        return;
+    }
+    let theme = app.theme();
+    let choices = &app.link_choices;
+    let width = area.width.saturating_sub(8).min(80).max(24);
+    let height = area.height.saturating_sub(4).min(choices.len() as u16 + 2);
+    let rect = centered(area, width, height);
+    let inner_width = width.saturating_sub(2) as usize;
+    let inner_height = height.saturating_sub(2) as usize;
+    let offset = selected.saturating_sub(inner_height.saturating_sub(1));
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_height);
+    for (index, link) in choices.iter().enumerate().skip(offset).take(inner_height) {
+        let is_selected = index == selected;
+        app.record_hit(
+            Rect::new(rect.x + 1, rect.y + 1 + lines.len() as u16, rect.width.saturating_sub(2), 1),
+            Hit::Link(index),
+        );
+        let number = if index < 9 { format!("{} ", index + 1) } else { "  ".to_string() };
+        let label = if link.label.trim().is_empty() { link.dest.clone() } else { link.label.clone() };
+        let used = 2 + 2 + label.chars().count() + 3;
+        let room = inner_width.saturating_sub(used);
+        let dest: String = if link.dest.chars().count() > room {
+            let keep = room.saturating_sub(1);
+            format!("{}…", link.dest.chars().take(keep).collect::<String>())
+        } else {
+            link.dest.clone()
+        };
+        let mut line = Line::from(vec![
+            Span::styled(
+                if is_selected { "▍ " } else { "  " },
+                Style::default().fg(if is_selected { theme.accent } else { theme.bg }),
+            ),
+            Span::styled(number, Style::default().fg(theme.fg_muted)),
+            Span::styled(
+                label,
+                if is_selected {
+                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.fg_dim)
+                },
+            ),
+            Span::styled(" → ", Style::default().fg(theme.border)),
+            Span::styled(dest, Style::default().fg(theme.fg_muted)),
+        ]);
+        if is_selected {
+            line = line.style(Style::default().bg(theme.bg_sel));
+        }
+        lines.push(line);
+    }
+
+    let hint = Line::from(Span::styled(
+        " Enter follow · 1-9 pick · Esc close ",
+        Style::default().fg(theme.fg_muted),
+    ));
+    let paragraph = Paragraph::new(lines)
+        .block(popup_block(&theme, "Links on this line").title_bottom(hint))
+        .style(Style::default().bg(theme.bg).fg(theme.fg));
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(paragraph, rect);
+    app.record_hit(rect, Hit::Panel);
 }

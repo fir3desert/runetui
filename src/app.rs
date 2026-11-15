@@ -6,6 +6,8 @@
 //! embedded one cannot start. The app owns the explorer, the viewer, the active theme
 //! and a small amount of UI state (focus, overlays, history, search prompt).
 
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,10 +22,11 @@ use ratatui::layout::Rect;
 use crate::config::{self, Config};
 use crate::editor::{EmbeddedEditor, PtyPane};
 use crate::filesystem::Explorer;
-use crate::filesystem::watcher::FileWatcher;
+use crate::filesystem::watcher::{FileWatcher, WatcherState};
 use crate::keymap::{Action, Chord, DEFAULT_PREFIX, Keymap, Resolution};
 use crate::stars::Stars;
-use crate::markdown::LinkKind;
+use crate::trace;
+use crate::markdown::{DocLink, LinkKind};
 use crate::markdown::code_highlighter::CodeHighlighter;
 use crate::markdown::toc;
 use crate::ui::help;
@@ -34,6 +37,12 @@ use crate::viewer::{LoadedDoc, Viewer, load_document};
 
 const STATUS_TTL: Duration = Duration::from_secs(5);
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(180);
+/// Background work shorter than this never shows the "indexing…" indicator,
+/// so quick listings do not make the status bar flicker.
+const INDEXING_GRACE: Duration = Duration::from_millis(150);
+/// Braille spinner frames and the ASCII fallback, advanced every 80 ms.
+const SPINNER_UNICODE: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_ASCII: [&str; 4] = ["|", "/", "-", "\\"];
 const HISTORY_LIMIT: usize = 100;
 const WIKI_SCAN_LIMIT: usize = 25_000;
 /// How long a pending prefix key waits for the key that completes it.
@@ -70,6 +79,10 @@ pub enum Overlay {
     Outline {
         selected: usize,
     },
+    /// Chooser for a line that holds several links (see `App::link_choices`).
+    Links {
+        selected: usize,
+    },
     /// btop-style theme chooser. `original` is restored when the menu is
     /// cancelled with Esc.
     Themes {
@@ -86,6 +99,31 @@ pub enum Overlay {
         selected: usize,
     },
 }
+
+/// A clickable region recorded while drawing an overlay, so the mouse handler
+/// knows what is under the pointer without recomputing the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    /// Entry of the Esc menu.
+    MenuItem(usize),
+    /// Tab of the Options screen.
+    OptionsTab(usize),
+    /// Row of the Options list (label and blanks).
+    Option(usize),
+    /// The value at the end of an Options row.
+    OptionValue(usize),
+    /// Row of the theme chooser.
+    Theme(usize),
+    /// Row of the outline.
+    Outline(usize),
+    /// Row of the links chooser.
+    Link(usize),
+    /// The frame of a popup: a click outside every panel dismisses it.
+    Panel,
+}
+
+/// Two clicks this close in time and place make a double click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// Entries of the Esc menu, in display order.
 pub const MENU_ITEMS: [&str; 3] = ["OPTIONS", "HELP", "QUIT"];
@@ -225,23 +263,44 @@ pub struct App {
     editor_request: Option<PathBuf>,
     refresh_pending: Option<Instant>,
     reload_pending: bool,
+    /// Directories whose listing changed since the last refresh.
+    dirty_dirs: HashSet<PathBuf>,
+    /// What the watcher was last told to watch: tree generation and open file.
+    watch_key: Option<(u64, Option<PathBuf>)>,
+    /// Why live refresh is limited or off, once the user has been told.
+    watcher_problem: Option<String>,
+    started_at: Instant,
+    /// Where the star count was drawn last frame, for mouse clicks.
+    pub star_rect: Cell<Option<Rect>>,
+    /// Clickable regions of the overlay drawn last frame.
+    pub hits: std::cell::RefCell<Vec<(Rect, Hit)>>,
+    /// When and where the last left click happened, for double clicks.
+    last_click: Option<(Instant, u16, u16)>,
+    /// Opens an address in the browser; replaced in tests.
+    pub(crate) opener: fn(&str) -> Result<(), String>,
+    /// The links offered by the `Overlay::Links` chooser.
+    pub(crate) link_choices: Vec<DocLink>,
+    /// Status text that replaces "Copied N characters" for the next copy.
+    clipboard_note: Option<String>,
 }
 
 impl App {
     pub fn with_config(cli_path: Option<&Path>, mut config: Config) -> Self {
-        let root = config::resolve_root(cli_path, &config);
+        let root = trace::span("resolve root", || config::resolve_root(cli_path, &config));
         let initial_file = config::resolve_initial_file(cli_path);
         let theme = config.theme_name();
         let keymap = Keymap::from_config(&config.prefix, &config.keys);
         let term_pct = config
             .terminal_height
             .clamp(MIN_TERMINAL_PCT, MAX_TERMINAL_PCT);
-        let mut explorer = Explorer::new(
-            &root,
-            config.explorer_width,
-            config.show_hidden,
-            config.respect_gitignore,
-        );
+        let mut explorer = trace::span("explorer: list root", || {
+            Explorer::new(
+                &root,
+                config.explorer_width,
+                config.show_hidden,
+                config.respect_gitignore,
+            )
+        });
 
         let mut app = Self {
             root: root.clone(),
@@ -260,7 +319,7 @@ impl App {
             area: Rect::new(0, 0, 100, 30),
             should_quit: false,
             config: config.clone(),
-            watcher: FileWatcher::new(&root).ok(),
+            watcher: Some(trace::span("filesystem watcher (start thread)", FileWatcher::start)),
             editor: None,
             term: None,
             show_term: config.show_terminal,
@@ -270,34 +329,46 @@ impl App {
             adjusting: false,
             selection: None,
             capturing_prefix: false,
-            stars: Stars::start(config.show_stars),
+            stars: trace::span("stars start", || Stars::start(config.show_stars)),
             selection_copied: false,
             clipboard: None,
             term_failed: false,
             menu_selected: 0,
             menu_opened: None,
             overlay_stack: Vec::new(),
-            highlighter: CodeHighlighter::new(),
+            highlighter: trace::span("syntax highlighter", CodeHighlighter::new),
             history: Vec::new(),
             forward: Vec::new(),
             editor_request: None,
             refresh_pending: None,
             reload_pending: false,
+            dirty_dirs: HashSet::new(),
+            watch_key: None,
+            watcher_problem: None,
+            started_at: Instant::now(),
+            star_rect: Cell::new(None),
+            hits: std::cell::RefCell::new(Vec::new()),
+            last_click: None,
+            opener: crate::browser::open_url,
+            link_choices: Vec::new(),
+            clipboard_note: None,
         };
 
         config.last_directory = Some(root.clone());
         app.config = config;
 
-        if let Some(file) = initial_file {
-            app.open_file(file, None, true);
-        } else {
-            let readme = root.join("README.md");
-            if readme.is_file() {
-                app.open_file(readme, None, true);
+        trace::span("initial document", || {
+            if let Some(file) = initial_file {
+                app.open_file(file, None, true);
             } else {
-                app.show_welcome();
+                let readme = root.join("README.md");
+                if readme.is_file() {
+                    app.open_file(readme, None, true);
+                } else {
+                    app.show_welcome();
+                }
             }
-        }
+        });
         // Start in the explorer so the project can be browsed immediately.
         app.focus = if app.layout.explorer.is_some() {
             Focus::Explorer
@@ -307,6 +378,7 @@ impl App {
         if let Some(warning) = app.keymap.warnings.first().cloned() {
             app.set_status(warning);
         }
+        app.sync_watcher();
         app
     }
 
@@ -542,6 +614,9 @@ impl App {
         {
             self.pending = None;
         }
+        self.explorer.poll();
+        self.sync_watcher();
+        self.poll_watcher_state();
         if let Some(watcher) = &self.watcher {
             if let Some(event) = watcher.drain() {
                 if let Some(current) = &self.viewer.loaded {
@@ -549,7 +624,10 @@ impl App {
                         self.reload_pending = true;
                     }
                 }
-                self.refresh_pending = Some(Instant::now());
+                self.dirty_dirs.extend(event.dirs);
+                // The window opens at the first event, so a steady stream of
+                // changes (a build, a download) cannot postpone it forever.
+                self.refresh_pending.get_or_insert_with(Instant::now);
             }
         }
 
@@ -558,7 +636,10 @@ impl App {
             .is_some_and(|since| since.elapsed() >= WATCH_DEBOUNCE)
         {
             self.refresh_pending = None;
-            self.explorer.refresh();
+            let dirs: Vec<PathBuf> = std::mem::take(&mut self.dirty_dirs).into_iter().collect();
+            if !dirs.is_empty() {
+                self.explorer.refresh_dirs(&dirs);
+            }
             if std::mem::take(&mut self.reload_pending) {
                 self.reload_current();
             }
@@ -566,6 +647,100 @@ impl App {
 
         if self.status.as_ref().is_some_and(StatusMessage::is_expired) {
             self.status = None;
+        }
+    }
+
+    // ------------------------------------------------------- background work
+
+    /// Tell the watcher which folders to watch: the ones open in the explorer
+    /// and the folder of the open document.  Does nothing unless they changed.
+    fn sync_watcher(&mut self) {
+        let Some(watcher) = &self.watcher else {
+            return;
+        };
+        let document = self.viewer.loaded.as_ref().map(|loaded| loaded.path.clone());
+        let key = (self.explorer.tree.generation(), document.clone());
+        if self.watch_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.watch_key = Some(key);
+        let mut dirs = self.explorer.tree.open_directories();
+        if let Some(parent) = document.as_deref().and_then(Path::parent) {
+            if !dirs.iter().any(|dir| dir == parent) {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+        watcher.sync(dirs);
+    }
+
+    /// Say once when live refresh is limited or unavailable.
+    fn poll_watcher_state(&mut self) {
+        let Some(watcher) = &self.watcher else {
+            return;
+        };
+        let problem = match watcher.state() {
+            WatcherState::Failed(reason) | WatcherState::Limited { reason, .. } => Some(reason),
+            WatcherState::Starting | WatcherState::Ready { .. } => None,
+        };
+        match (problem, self.watcher_problem.is_some()) {
+            (Some(reason), false) => {
+                let refresh = self
+                    .keymap
+                    .primary(Action::Refresh)
+                    .map(|chord| chord.label())
+                    .unwrap_or_else(|| "r".to_string());
+                self.set_status(format!(
+                    "Live refresh limited ({reason}); press {refresh} to refresh by hand"
+                ));
+                self.watcher_problem = Some(reason);
+            }
+            (None, true) => self.watcher_problem = None,
+            _ => {}
+        }
+    }
+
+    /// Why live refresh is limited or off, if it is.
+    pub fn watcher_problem(&self) -> Option<&str> {
+        self.watcher_problem.as_deref()
+    }
+
+    /// Something is running in the background: a directory listing or the
+    /// watcher starting up.
+    pub fn is_busy(&self) -> bool {
+        self.work_started().is_some()
+    }
+
+    fn work_started(&self) -> Option<Instant> {
+        let watcher_starting = self
+            .watcher
+            .as_ref()
+            .is_some_and(|watcher| watcher.state() == WatcherState::Starting)
+            && self.watch_key.is_some();
+        let listing = self.explorer.busy_since();
+        match (watcher_starting.then_some(self.started_at), listing) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
+    }
+
+    /// Background work has been running long enough to deserve an "indexing…"
+    /// indicator.
+    pub fn indexing(&self) -> bool {
+        self.work_started()
+            .is_some_and(|since| since.elapsed() >= INDEXING_GRACE)
+    }
+
+    /// Current frame of the indexing spinner.
+    pub fn spinner(&self) -> &'static str {
+        let step = self
+            .work_started()
+            .map(|since| since.elapsed().as_millis() / 80)
+            .unwrap_or(0) as usize;
+        if self.config.icon_style() == crate::ui::icons::IconStyle::Ascii {
+            SPINNER_ASCII[step % SPINNER_ASCII.len()]
+        } else {
+            SPINNER_UNICODE[step % SPINNER_UNICODE.len()]
         }
     }
 
@@ -865,18 +1040,76 @@ impl App {
 
     // ----------------------------------------------------------------- links
 
-    fn follow_link(&mut self) {
-        let Some(link) = self.viewer.doc.link_at(self.viewer.cursor).cloned() else {
-            self.set_status("No link on this line");
-            return;
-        };
-        if link.image {
-            self.set_status(format!("Image: {} (images are not rendered)", link.dest));
-            return;
+    /// Follow the link on the cursor line.  One link is followed at once;
+    /// several open a chooser.  `quiet` (Space) says nothing when the line has
+    /// no link, so the key can be tapped freely; Enter explains.
+    fn follow_link(&mut self, quiet: bool) {
+        let cursor = self.viewer.cursor;
+        let mut on_line: Vec<DocLink> = self
+            .viewer
+            .doc
+            .links
+            .iter()
+            .filter(|link| link.line == cursor)
+            .cloned()
+            .collect();
+        on_line.sort_by_key(|link| link.column);
+
+        let first_image = on_line.iter().find(|link| link.image).cloned();
+        let mut links: Vec<DocLink> = Vec::new();
+        for link in on_line.into_iter().filter(|link| !link.image) {
+            // The same target twice on a line is one choice.
+            if !links
+                .iter()
+                .any(|seen| seen.dest == link.dest && seen.kind == link.kind)
+            {
+                links.push(link);
+            }
         }
+
+        match links.len() {
+            0 => {
+                if let Some(image) = first_image {
+                    self.set_status(format!(
+                        "Image: {} (images are not rendered)",
+                        image.dest
+                    ));
+                } else if !quiet {
+                    self.set_status("No link on this line");
+                }
+            }
+            1 => self.follow_one(links.remove(0)),
+            _ => {
+                self.link_choices = links;
+                self.overlay = Overlay::Links { selected: 0 };
+            }
+        }
+    }
+
+    /// Follow a link chosen in the chooser.
+    fn choose_link(&mut self, index: usize) {
+        let link = self.link_choices.get(index).cloned();
+        self.link_choices.clear();
+        self.overlay = Overlay::None;
+        if let Some(link) = link {
+            self.follow_one(link);
+        }
+    }
+
+    /// Nothing is ever executed from a link: documents inside the project are
+    /// opened in the viewer, `http(s)` and `mailto:` addresses go to the
+    /// browser, everything else is refused with a message.
+    fn follow_one(&mut self, link: DocLink) {
         match link.kind {
             LinkKind::External => {
-                self.set_status(format!("External link: {} (not opened)", link.dest));
+                let dest = link.dest.trim();
+                if crate::browser::is_openable(dest) {
+                    self.open_url(dest);
+                } else {
+                    self.set_status(format!(
+                        "Not opening {dest}: only http(s) and mailto links are opened"
+                    ));
+                }
             }
             LinkKind::Anchor => self.navigate_anchor(&link.dest),
             LinkKind::Wiki => self.follow_wiki_link(&link.dest),
@@ -910,8 +1143,10 @@ impl App {
             }
             return;
         }
-        if path_part.contains("://") {
-            self.set_status(format!("External link: {dest} (not opened)"));
+        if has_url_scheme(&path_part) {
+            self.set_status(format!(
+                "Not opening {dest}: only http(s) and mailto links are opened"
+            ));
             return;
         }
 
@@ -930,12 +1165,28 @@ impl App {
             candidate.set_extension("md");
         }
 
+        if candidate.exists() && self.outside_project(&candidate) {
+            self.set_status(format!(
+                "Link leaves the project folder: {path_part} (not followed)"
+            ));
+            return;
+        }
+
         if candidate.is_dir() {
             self.focus_folder(&candidate);
         } else if candidate.is_file() {
             self.open_file(candidate, fragment.map(str::to_string), true);
         } else {
             self.set_status(format!("Cannot find linked file: {path_part}"));
+        }
+    }
+
+    /// Does `path` resolve (through `..` and symlinks) to somewhere outside the
+    /// project root?
+    fn outside_project(&self, path: &Path) -> bool {
+        match (path.canonicalize(), self.root.canonicalize()) {
+            (Ok(path), Ok(root)) => !path.starts_with(root),
+            _ => false,
         }
     }
 
@@ -1191,6 +1442,15 @@ impl App {
             Action::TerminalGrow => self.resize_terminal(TERMINAL_STEP),
             Action::TerminalShrink => self.resize_terminal(-TERMINAL_STEP),
             Action::ForceClose => self.force_close(),
+            Action::FollowLink => match self.focus {
+                Focus::Viewer => self.follow_link(true),
+                // In the explorer Space keeps opening files and folding folders.
+                Focus::Explorer => {
+                    self.activate();
+                    self.preview_selection();
+                }
+                Focus::Terminal => {}
+            },
         }
     }
 
@@ -1266,10 +1526,24 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) {
-        if !self.config.mouse || self.overlay.is_open() || self.search_input.is_some() {
+        if !self.config.mouse {
             return;
         }
         let (x, y) = (event.column, event.row);
+        // The star count (header or Esc menu) opens the repository.
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.star_rect.get().is_some_and(|rect| rect.contains((x, y).into()))
+        {
+            self.open_url(crate::stars::REPO_URL);
+            return;
+        }
+        if self.overlay.is_open() {
+            self.handle_overlay_mouse(event);
+            return;
+        }
+        if self.search_input.is_some() {
+            return;
+        }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => self.mouse_down(x, y),
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -1297,6 +1571,141 @@ impl App {
         }
     }
 
+    /// Record a left click and say whether it completes a double click.
+    fn register_click(&mut self, x: u16, y: u16) -> bool {
+        let now = Instant::now();
+        let double = self.last_click.is_some_and(|(when, last_x, last_y)| {
+            now.duration_since(when) <= DOUBLE_CLICK && last_y == y && last_x.abs_diff(x) <= 3
+        });
+        self.last_click = if double { None } else { Some((now, x, y)) };
+        double
+    }
+
+    /// Click in the explorer: the chevron of a folder folds it without
+    /// touching the open document, the name selects (and previews a file),
+    /// and a double click opens a file or folds the folder.
+    fn explorer_click(&mut self, x: u16, y: u16, rect: Rect) {
+        let double = self.register_click(x, y);
+        let position = self.explorer.offset() + (y - rect.y) as usize;
+        let Some(&node_index) = self.explorer.visible().get(position) else {
+            return;
+        };
+        let on_chevron = self.explorer.tree.node(node_index).is_some_and(|node| {
+            crate::ui::explorer::chevron_columns(node, self.config.icon_style())
+                .is_some_and(|(start, width)| x >= rect.x + start && x < rect.x + start + width)
+        });
+        self.explorer.select_position(position);
+        if on_chevron {
+            self.last_click = None;
+            self.explorer.toggle_selected();
+        } else if double {
+            self.activate();
+            self.preview_selection();
+        } else {
+            self.preview_selection();
+        }
+    }
+
+    /// Note a clickable region while drawing.
+    pub fn record_hit(&self, rect: Rect, hit: Hit) {
+        self.hits.borrow_mut().push((rect, hit));
+    }
+
+    fn hit_at(&self, x: u16, y: u16) -> Option<Hit> {
+        self.hits
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(rect, hit)| *hit != Hit::Panel && rect.contains((x, y).into()))
+            .map(|(_, hit)| *hit)
+    }
+
+    /// Is the pointer outside every popup frame (and is there one at all)?
+    fn outside_popups(&self, x: u16, y: u16) -> bool {
+        let hits = self.hits.borrow();
+        let mut any = false;
+        for (rect, hit) in hits.iter() {
+            if *hit == Hit::Panel {
+                any = true;
+                if rect.contains((x, y).into()) {
+                    return false;
+                }
+            }
+        }
+        any
+    }
+
+    fn press_overlay_key(&mut self, code: KeyCode) {
+        self.handle_overlay_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn handle_overlay_mouse(&mut self, event: MouseEvent) {
+        // While the prefix key is being captured only a key press counts.
+        if self.capturing_prefix {
+            return;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => self.overlay_wheel(false),
+            MouseEventKind::ScrollDown => self.overlay_wheel(true),
+            MouseEventKind::Down(MouseButton::Left) => self.overlay_click(event.column, event.row),
+            _ => {}
+        }
+    }
+
+    fn overlay_wheel(&mut self, down: bool) {
+        let (code, times) = match (self.overlay, down) {
+            (Overlay::Help { .. }, true) => (KeyCode::Down, WHEEL_LINES as usize),
+            (Overlay::Help { .. }, false) => (KeyCode::Up, WHEEL_LINES as usize),
+            (_, true) => (KeyCode::Down, 1),
+            (_, false) => (KeyCode::Up, 1),
+        };
+        for _ in 0..times {
+            self.press_overlay_key(code);
+        }
+    }
+
+    fn overlay_click(&mut self, x: u16, y: u16) {
+        let double = self.register_click(x, y);
+        let hit = self.hit_at(x, y);
+        match (self.overlay, hit) {
+            (Overlay::Menu { .. }, Some(Hit::MenuItem(index))) => {
+                self.overlay = Overlay::Menu { selected: index };
+                self.press_overlay_key(KeyCode::Enter);
+            }
+            (Overlay::Options { .. }, Some(Hit::OptionsTab(index))) => {
+                self.adjusting = false;
+                self.overlay = Overlay::Options { tab: index, selected: 0 };
+            }
+            (Overlay::Options { tab, .. }, Some(Hit::Option(index))) => {
+                self.adjusting = false;
+                self.overlay = Overlay::Options { tab, selected: index };
+                if double {
+                    self.press_overlay_key(KeyCode::Enter);
+                }
+            }
+            (Overlay::Options { tab, .. }, Some(Hit::OptionValue(index))) => {
+                self.adjusting = false;
+                self.overlay = Overlay::Options { tab, selected: index };
+                self.press_overlay_key(KeyCode::Enter);
+            }
+            (Overlay::Themes { selected, .. }, Some(Hit::Theme(index))) => {
+                // Walk there with the arrows so the live preview follows.
+                let code = if index >= selected { KeyCode::Down } else { KeyCode::Up };
+                for _ in 0..index.abs_diff(selected) {
+                    self.press_overlay_key(code);
+                }
+                self.press_overlay_key(KeyCode::Enter);
+            }
+            (Overlay::Outline { .. }, Some(Hit::Outline(index))) => {
+                self.overlay = Overlay::Outline { selected: index };
+                self.press_overlay_key(KeyCode::Enter);
+            }
+            (Overlay::Links { .. }, Some(Hit::Link(index))) => self.choose_link(index),
+            (_, None) if self.outside_popups(x, y) => self.press_overlay_key(KeyCode::Esc),
+            _ => {}
+        }
+    }
+
     fn mouse_down(&mut self, x: u16, y: u16) {
         self.selection = None;
         self.selection_copied = false;
@@ -1309,13 +1718,7 @@ impl App {
         match pane {
             // The explorer is for picking files: a click selects the row and
             // its text is never part of a selection.
-            Focus::Explorer => {
-                let position = self.explorer.offset() + (y - rect.y) as usize;
-                if position < self.explorer.visible().len() {
-                    self.explorer.select_position(position);
-                    self.preview_selection();
-                }
-            }
+            Focus::Explorer => self.explorer_click(x, y, rect),
             Focus::Viewer | Focus::Terminal => {
                 self.selection = Some(Selection::new(rect, x, y));
             }
@@ -1372,6 +1775,28 @@ impl App {
     }
 
     /// Text waiting to be sent to the system clipboard, if any.
+    /// Open a web address in the browser.  Without a browser (a server over
+    /// SSH, say) the address is copied with OSC 52 instead, and the status bar
+    /// says so.
+    pub fn open_url(&mut self, url: &str) {
+        match (self.opener)(url) {
+            Ok(()) => self.set_status(format!("Opened {url} in the browser")),
+            Err(reason) => {
+                let note = format!("No browser ({reason}); copied {url}");
+                self.clipboard = Some(url.to_string());
+                self.clipboard_note = Some(note.clone());
+                self.set_status(note);
+            }
+        }
+    }
+
+    /// Status message for a copy just handed to the terminal.
+    pub fn copy_status(&mut self, text: &str) -> String {
+        self.clipboard_note
+            .take()
+            .unwrap_or_else(|| format!("Copied {} characters", text.chars().count()))
+    }
+
     pub fn take_clipboard(&mut self) -> Option<String> {
         self.clipboard.take()
     }
@@ -1472,6 +1897,33 @@ impl App {
                 self.overlay = Overlay::Outline {
                     selected: next.min(count.saturating_sub(1)),
                 };
+            }
+            Overlay::Links { selected } => {
+                let count = self.link_choices.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.link_choices.clear();
+                        self.overlay = Overlay::None;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.overlay = Overlay::Links {
+                            selected: (selected + 1).min(count.saturating_sub(1)),
+                        };
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.overlay = Overlay::Links {
+                            selected: selected.saturating_sub(1),
+                        };
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => self.choose_link(selected),
+                    KeyCode::Char(digit @ '1'..='9') => {
+                        let index = digit as usize - '1' as usize;
+                        if index < count {
+                            self.choose_link(index);
+                        }
+                    }
+                    _ => {}
+                }
             }
             Overlay::Themes { selected, original } => {
                 let count = ThemeName::ALL.len();
@@ -1733,7 +2185,7 @@ impl App {
                     }
                 }
             }
-            Focus::Viewer => self.follow_link(),
+            Focus::Viewer => self.follow_link(false),
             Focus::Terminal => {}
         }
     }
@@ -1927,6 +2379,19 @@ impl Default for App {
     fn default() -> Self {
         Self::with_config(None, Config::default())
     }
+}
+
+/// Does a link target start with a URL scheme (`javascript:`, `file:`, …)?
+/// Single letters are drive names (`C:\\notes`), not schemes.
+fn has_url_scheme(target: &str) -> bool {
+    let Some((scheme, _)) = target.split_once(':') else {
+        return false;
+    };
+    scheme.len() >= 2
+        && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
 }
 
 #[cfg(test)]
@@ -2184,6 +2649,10 @@ mod tests {
         let line = line_of_link(&app, "notes/guide.md");
         app.viewer.jump_to_line(line);
         app.focus = Focus::Viewer;
+        // The README line holds two links: a chooser opens, the first is the
+        // relative Markdown link.
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.overlay, Overlay::Links { .. }));
         press(&mut app, KeyCode::Enter);
         assert_eq!(
             app.viewer.loaded.as_ref().unwrap().display_name(),
@@ -2199,7 +2668,10 @@ mod tests {
         let line = line_of_link(&app, "guide");
         app.viewer.jump_to_line(line);
         app.focus = Focus::Viewer;
+        // Two links on the line: pick the second, the [[wikilink]], by number.
         press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.overlay, Overlay::None);
         assert_eq!(
             app.viewer.loaded.as_ref().unwrap().display_name(),
             "guide.md"
@@ -2232,6 +2704,7 @@ mod tests {
         let line = line_of_link(&app, "notes/guide.md");
         app.viewer.jump_to_line(line);
         app.focus = Focus::Viewer;
+        press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
         assert_eq!(
             app.viewer.loaded.as_ref().unwrap().display_name(),
@@ -2465,7 +2938,7 @@ mod tests {
     }
 
     #[test]
-    fn external_links_are_reported_not_opened() {
+    fn external_links_open_in_the_browser() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("README.md"),
@@ -2476,8 +2949,11 @@ mod tests {
         let line = line_of_link(&app, "https://example.com");
         app.viewer.jump_to_line(line);
         app.focus = Focus::Viewer;
+        app.opener = stub_opener;
+        OPENED.with(|log| log.borrow_mut().clear());
         press(&mut app, KeyCode::Enter);
-        assert!(app.status_text().unwrap().contains("External link"));
+        OPENED.with(|log| assert_eq!(*log.borrow(), vec!["https://example.com".to_string()]));
+        assert!(app.status_text().unwrap().contains("Opened"));
         assert_eq!(
             app.viewer.loaded.as_ref().unwrap().display_name(),
             "README.md"
@@ -3207,5 +3683,792 @@ mod tests {
         assert_eq!(app.viewer.cursor, 2500);
         app.reload_current();
         assert_eq!(app.viewer.cursor, 2500);
+    }
+
+    fn tick_until(app: &mut App, what: &str, done: impl Fn(&App) -> bool) {
+        let started = Instant::now();
+        while !done(app) {
+            app.tick();
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn indexing_shows_only_after_the_grace_period_and_clears_when_done() {
+        let dir = project();
+        let mut app = app(&dir);
+        assert!(!app.is_busy() && !app.indexing());
+        app.explorer.tree.set_listing_delay(Duration::from_millis(500));
+        app.explorer.tree.set_load_budget(Duration::ZERO);
+        let notes = app.explorer.tree.find_path(&dir.path().join("notes")).unwrap();
+        app.explorer.tree.expand(notes);
+
+        assert!(app.is_busy());
+        assert!(!app.indexing(), "quick work must not flash the indicator");
+        std::thread::sleep(INDEXING_GRACE + Duration::from_millis(30));
+        assert!(app.indexing());
+        assert!(!app.spinner().is_empty());
+
+        tick_until(&mut app, "the listing", |app| !app.is_busy());
+        assert!(!app.indexing());
+        assert!(app.explorer.tree.find_path(&dir.path().join("notes/guide.md")).is_some());
+    }
+
+    #[test]
+    fn the_spinner_turns_and_has_an_ascii_form() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.explorer.tree.set_listing_delay(Duration::from_millis(600));
+        app.explorer.tree.set_load_budget(Duration::ZERO);
+        let notes = app.explorer.tree.find_path(&dir.path().join("notes")).unwrap();
+        app.explorer.tree.expand(notes);
+        let first = app.spinner();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_ne!(app.spinner(), first, "the frame advances");
+        app.config.set_icon_style(crate::ui::icons::IconStyle::Ascii);
+        assert!(["|", "/", "-", "\\"].contains(&app.spinner()));
+    }
+
+    #[test]
+    fn a_broken_watcher_is_announced_once_and_marked_in_the_status_bar() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.watcher = Some(FileWatcher::failed("the system's file-watch limit was reached"));
+        app.tick();
+        let status = app.status_text().expect("a message").to_string();
+        assert!(status.contains("Live refresh limited") && status.contains("file-watch limit"), "{status}");
+        assert!(status.contains("refresh by hand"));
+        assert!(app.watcher_problem().is_some());
+
+        // Said once: a later message is not overwritten.
+        app.set_status("something else");
+        app.tick();
+        assert_eq!(app.status_text(), Some("something else"));
+
+        // The program keeps working: a manual refresh still sees new files.
+        fs::write(dir.path().join("after.md"), b"x\n").unwrap();
+        app.explorer.refresh();
+        assert!(app.explorer.tree.find_path(&dir.path().join("after.md")).is_some());
+    }
+
+    #[test]
+    fn new_files_show_up_through_the_background_watcher() {
+        let dir = project();
+        let mut app = app(&dir);
+        tick_until(&mut app, "the watcher", |app| {
+            app.watcher.as_ref().is_some_and(|w| w.state() != WatcherState::Starting)
+        });
+        fs::write(dir.path().join("fresh.md"), b"# Fresh\n").unwrap();
+        tick_until(&mut app, "the new file", |app| {
+            app.explorer.tree.find_path(&dir.path().join("fresh.md")).is_some()
+        });
+    }
+
+    #[test]
+    fn the_watcher_follows_the_folders_that_are_open() {
+        let dir = project();
+        let mut app = app(&dir);
+        let key = app.watch_key.clone().expect("synced at start");
+        let notes = app.explorer.tree.find_path(&dir.path().join("notes")).unwrap();
+        app.explorer.tree.expand(notes);
+        app.tick();
+        assert_ne!(app.watch_key, Some(key), "opening a folder re-syncs the watcher");
+        // A change inside the newly opened folder is noticed.
+        tick_until(&mut app, "the watcher", |app| {
+            app.watcher.as_ref().is_some_and(|w| w.state() == WatcherState::Ready { dirs: 2 })
+        });
+        fs::write(dir.path().join("notes/extra.md"), b"x\n").unwrap();
+        tick_until(&mut app, "the new file", |app| {
+            app.explorer.tree.find_path(&dir.path().join("notes/extra.md")).is_some()
+        });
+    }
+
+    #[test]
+    fn a_stream_of_changes_cannot_postpone_the_refresh_forever() {
+        let dir = project();
+        let mut app = app(&dir);
+        tick_until(&mut app, "the watcher", |app| {
+            app.watcher.as_ref().is_some_and(|w| w.state() != WatcherState::Starting)
+        });
+        let started = Instant::now();
+        let mut number = 0;
+        // Keep touching the folder faster than the debounce window.
+        while app.explorer.tree.find_path(&dir.path().join("burst0.md")).is_none() {
+            fs::write(dir.path().join(format!("burst{number}.md")), b"x\n").unwrap();
+            number += 1;
+            std::thread::sleep(Duration::from_millis(40));
+            app.tick();
+            assert!(started.elapsed() < Duration::from_secs(5), "starved by constant events");
+        }
+    }
+
+    // ------------------------------------------------- following links (Space)
+
+    thread_local! {
+        static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn stub_opener(url: &str) -> Result<(), String> {
+        OPENED.with(|log| log.borrow_mut().push(url.to_string()));
+        Ok(())
+    }
+    fn opened() -> Vec<String> {
+        OPENED.with(|log| log.borrow().clone())
+    }
+
+    /// An app over a temporary project made of `files`, with the first one
+    /// open, focus in the document and the browser stubbed out.
+    fn linked(files: &[(&str, &str)]) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in files {
+            let path = dir.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let mut app = app(&dir);
+        app.opener = stub_opener;
+        OPENED.with(|log| log.borrow_mut().clear());
+        app.focus = Focus::Viewer;
+        (dir, app)
+    }
+
+    fn goto_link(app: &mut App, dest_fragment: &str) {
+        let line = line_of_link(app, dest_fragment);
+        app.viewer.jump_to_line(line);
+        app.focus = Focus::Viewer;
+    }
+
+    fn open_name(app: &App) -> String {
+        app.viewer.loaded.as_ref().unwrap().display_name().to_string()
+    }
+
+    #[test]
+    fn space_is_the_default_binding_and_help_lists_it() {
+        let dir = project();
+        let app = app(&dir);
+        assert_eq!(app.keymap.labels(Action::FollowLink), vec!["Space".to_string()]);
+        assert!(crate::ui::help::rendered_text(&app.keymap).contains("Follow the link on the line"));
+    }
+
+    #[test]
+    fn space_follows_a_relative_link_with_history_and_explorer_sync() {
+        let (_dir, mut app) = linked(&[
+            ("README.md", "# Home\n\nGo to [the guide](notes/guide.md).\n"),
+            ("notes/guide.md", "# Guide\n"),
+        ]);
+        goto_link(&mut app, "notes/guide.md");
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(open_name(&app), "guide.md");
+        assert_eq!(app.history.len(), 1, "the jump is in the history");
+        assert_eq!(
+            app.explorer.selected_path().unwrap().file_name().unwrap(),
+            "guide.md",
+            "the explorer follows the document"
+        );
+        press_ctrl(&mut app, 'o');
+        assert_eq!(open_name(&app), "README.md");
+    }
+
+    #[test]
+    fn space_handles_encoded_spaces_and_jumps_to_the_heading() {
+        let (_dir, mut app) = linked(&[
+            ("README.md", "# Home\n\nSee [deep](my%20notes/Deep%20Doc.md#section-two).\n"),
+            (
+                "my notes/Deep Doc.md",
+                "# Deep\n\ntext\n\n## Section One\n\nx\n\n## Section Two\n\ny\n",
+            ),
+        ]);
+        goto_link(&mut app, "Deep%20Doc.md");
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(open_name(&app), "Deep Doc.md");
+        assert_eq!(app.viewer.heading_nearest_cursor().unwrap().text, "Section Two");
+    }
+
+    #[test]
+    fn space_follows_an_internal_anchor() {
+        let (_dir, mut app) = linked(&[(
+            "README.md",
+            "# Home\n\nJump to [details](#details).\n\n## Details\n\ntext\n",
+        )]);
+        goto_link(&mut app, "#details");
+        let before = app.viewer.cursor;
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.viewer.cursor > before);
+        assert_eq!(app.viewer.heading_nearest_cursor().unwrap().text, "Details");
+        assert_eq!(open_name(&app), "README.md");
+    }
+
+    #[test]
+    fn space_opens_web_and_mail_links_in_the_browser_only() {
+        let (_dir, mut app) = linked(&[(
+            "README.md",
+            "# L\n\n[web](https://example.com/a?b=1)\n\n[mail](mailto:me@example.com)\n\n[ftp](ftp://example.com/x)\n\n[js](javascript:alert(1))\n\n[file](file:///etc/passwd)\n",
+        )]);
+        goto_link(&mut app, "https://example.com");
+        press(&mut app, KeyCode::Char(' '));
+        goto_link(&mut app, "mailto:");
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(
+            opened(),
+            vec!["https://example.com/a?b=1".to_string(), "mailto:me@example.com".to_string()]
+        );
+
+        for dest in ["ftp://", "javascript:", "file:///"] {
+            goto_link(&mut app, dest);
+            press(&mut app, KeyCode::Char(' '));
+            let status = app.status_text().unwrap().to_string();
+            assert!(status.contains("Not opening"), "{dest}: {status}");
+        }
+        assert_eq!(opened().len(), 2, "nothing else reached the browser");
+        assert_eq!(open_name(&app), "README.md");
+    }
+
+    #[test]
+    fn a_missing_destination_says_so_and_changes_nothing() {
+        let (_dir, mut app) = linked(&[("README.md", "# Home\n\n[gone](notes/missing.md)\n")]);
+        goto_link(&mut app, "missing.md");
+        press(&mut app, KeyCode::Char(' '));
+        let status = app.status_text().unwrap().to_string();
+        assert!(status.contains("Cannot find linked file"), "{status}");
+        assert_eq!(open_name(&app), "README.md");
+        assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn space_on_a_line_without_a_link_is_silent_but_enter_explains() {
+        let (_dir, mut app) = linked(&[("README.md", "# Home\n\nplain text\n")]);
+        app.viewer.jump_to_line(2);
+        app.set_status("before");
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.status_text(), Some("before"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status_text(), Some("No link on this line"));
+    }
+
+    #[test]
+    fn links_cannot_lead_out_of_the_project_root() {
+        let outer = tempfile::tempdir().unwrap();
+        fs::write(outer.path().join("secret.md"), "# Secret\n").unwrap();
+        let root = outer.path().join("project");
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join("README.md"),
+            "# Home\n\n[up](../secret.md)\n\n[abs](/../secret.md)\n",
+        )
+        .unwrap();
+        let mut app = App::with_config(Some(&root), Config::default());
+        app.set_terminal_area(Rect::new(0, 0, 100, 30));
+        app.focus = Focus::Viewer;
+        goto_link(&mut app, "../secret.md");
+        press(&mut app, KeyCode::Char(' '));
+        let status = app.status_text().unwrap().to_string();
+        assert!(status.contains("leaves the project folder"), "{status}");
+        assert_eq!(open_name(&app), "README.md");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_project_is_refused_too() {
+        let outer = tempfile::tempdir().unwrap();
+        fs::write(outer.path().join("secret.md"), "# Secret\n").unwrap();
+        let root = outer.path().join("project");
+        fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(outer.path().join("secret.md"), root.join("shortcut.md")).unwrap();
+        fs::write(root.join("README.md"), "# Home\n\n[sneaky](shortcut.md)\n").unwrap();
+        let mut app = App::with_config(Some(&root), Config::default());
+        app.set_terminal_area(Rect::new(0, 0, 100, 30));
+        app.focus = Focus::Viewer;
+        goto_link(&mut app, "shortcut.md");
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.status_text().unwrap().contains("leaves the project folder"));
+        assert_eq!(open_name(&app), "README.md");
+    }
+
+    #[test]
+    fn several_links_on_a_line_open_a_chooser() {
+        let (_dir, mut app) = linked(&[
+            ("README.md", "# Home\n\n[a](a.md) · [b](b.md) · [site](https://example.com)\n"),
+            ("a.md", "# A\n"),
+            ("b.md", "# B\n"),
+        ]);
+        goto_link(&mut app, "a.md");
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.overlay, Overlay::Links { selected: 0 });
+        assert_eq!(app.link_choices.len(), 3);
+        // Navigation inside the chooser, bounded at both ends.
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.overlay, Overlay::Links { selected: 0 });
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.overlay, Overlay::Links { selected: 2 });
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.link_choices.is_empty());
+        assert_eq!(open_name(&app), "b.md");
+    }
+
+    #[test]
+    fn the_chooser_can_pick_by_number_and_reach_the_browser_and_can_be_cancelled() {
+        let (_dir, mut app) = linked(&[
+            ("README.md", "# Home\n\n[a](a.md) [site](https://example.com)\n"),
+            ("a.md", "# A\n"),
+        ]);
+        goto_link(&mut app, "a.md");
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(open_name(&app), "README.md");
+        assert!(opened().is_empty());
+
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('9'));
+        assert!(matches!(app.overlay, Overlay::Links { .. }), "no such entry: still open");
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(opened(), vec!["https://example.com".to_string()]);
+    }
+
+    #[test]
+    fn the_same_target_twice_on_a_line_is_followed_without_asking() {
+        let (_dir, mut app) = linked(&[
+            ("README.md", "# Home\n\n[one](a.md) and again [two](a.md)\n"),
+            ("a.md", "# A\n"),
+        ]);
+        goto_link(&mut app, "a.md");
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(open_name(&app), "a.md");
+    }
+
+    #[test]
+    fn the_chooser_is_drawn_with_labels_and_targets() {
+        let (_dir, mut app) = linked(&[
+            ("README.md", "# Home\n\n[alpha](a.md) [beta](https://example.com)\n"),
+            ("a.md", "# A\n"),
+        ]);
+        goto_link(&mut app, "a.md");
+        press(&mut app, KeyCode::Char(' '));
+        let text = crate::ui::render_to_text_for_test(&mut app, 100, 30);
+        assert!(text.contains("Links on this line"), "{text}");
+        assert!(text.contains("alpha") && text.contains("a.md"), "{text}");
+        assert!(text.contains("beta") && text.contains("https://example.com"), "{text}");
+    }
+
+    #[test]
+    fn space_in_the_explorer_still_opens_files_and_folds_folders() {
+        let (_dir, mut app) = linked(&[
+            ("README.md", "# Home\n"),
+            ("notes/guide.md", "# Guide\n"),
+        ]);
+        app.focus = Focus::Explorer;
+        let notes = app.explorer.tree.find_path(&app.root.join("notes")).unwrap();
+        let position = app.explorer.visible().iter().position(|&i| i == notes).unwrap();
+        app.explorer.select_position(position);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.explorer.tree.is_expanded(notes));
+        press(&mut app, KeyCode::Char(' '));
+        assert!(!app.explorer.tree.is_expanded(notes));
+    }
+
+    #[test]
+    fn space_types_a_space_in_the_search_box_and_does_nothing_in_code_files() {
+        let (_dir, mut app) = linked(&[
+            ("README.md", "# Home\n\nalpha beta\n"),
+            ("main.rs", "fn main() { let a = \"https://example.com\"; }\n"),
+        ]);
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(app.search_input.as_deref(), Some("a b"));
+        press(&mut app, KeyCode::Esc);
+
+        app.open_file(app.root.join("main.rs"), None, true);
+        app.set_status("before");
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.status_text(), Some("before"));
+        assert!(opened().is_empty());
+    }
+
+    // ------------------------------------------------ mouse in menus/explorer
+
+    fn draw_now(app: &mut App) -> String {
+        crate::ui::render_to_text_for_test(app, 120, 40)
+    }
+
+    fn send_mouse(app: &mut App, kind: MouseEventKind, x: u16, y: u16) {
+        app.handle_mouse(MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    fn rect_of(app: &App, hit: Hit) -> Rect {
+        app.hits
+            .borrow()
+            .iter()
+            .find(|(_, candidate)| *candidate == hit)
+            .map(|(rect, _)| *rect)
+            .unwrap_or_else(|| panic!("{hit:?} was not drawn"))
+    }
+
+    fn click_on(app: &mut App, hit: Hit) {
+        let rect = rect_of(app, hit);
+        send_mouse(app, MouseEventKind::Down(MouseButton::Left), rect.x + rect.width / 2, rect.y);
+        send_mouse(app, MouseEventKind::Up(MouseButton::Left), rect.x + rect.width / 2, rect.y);
+    }
+
+    fn wheel(app: &mut App, down: bool) {
+        let kind = if down { MouseEventKind::ScrollDown } else { MouseEventKind::ScrollUp };
+        send_mouse(app, kind, 10, 10);
+    }
+
+    fn open_menu(app: &mut App) {
+        press(app, KeyCode::Esc);
+        app.finish_menu_animation();
+        draw_now(app);
+    }
+
+    #[test]
+    fn clicking_a_menu_entry_activates_it() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_menu(&mut app);
+        click_on(&mut app, Hit::MenuItem(1));
+        assert!(matches!(app.overlay, Overlay::Help { .. }), "{:?}", app.overlay);
+
+        press(&mut app, KeyCode::Esc); // back to the menu
+        draw_now(&mut app);
+        click_on(&mut app, Hit::MenuItem(0));
+        assert!(matches!(app.overlay, Overlay::Options { .. }), "{:?}", app.overlay);
+
+        press(&mut app, KeyCode::Esc);
+        draw_now(&mut app);
+        click_on(&mut app, Hit::MenuItem(2));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn the_wheel_moves_the_menu_selection_and_clicks_elsewhere_do_nothing() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_menu(&mut app);
+        let start = app.overlay;
+        wheel(&mut app, true);
+        assert_ne!(app.overlay, start);
+        let after = app.overlay;
+        wheel(&mut app, false);
+        assert_eq!(app.overlay, start);
+        let _ = after;
+        // A click on empty space neither closes nor activates anything.
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, 1);
+        assert_eq!(app.overlay, start);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn menu_mouse_works_in_the_compact_layout_too() {
+        let dir = project();
+        let mut app = app(&dir);
+        press(&mut app, KeyCode::Esc);
+        app.finish_menu_animation();
+        crate::ui::render_to_text_for_test(&mut app, 40, 14);
+        click_on(&mut app, Hit::MenuItem(1));
+        assert!(matches!(app.overlay, Overlay::Help { .. }));
+    }
+
+    fn open_options(app: &mut App) {
+        open_menu(app);
+        click_on(app, Hit::MenuItem(0));
+        draw_now(app);
+    }
+
+    #[test]
+    fn options_tabs_rows_and_values_respond_to_clicks() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_options(&mut app);
+
+        // Tabs.
+        click_on(&mut app, Hit::OptionsTab(1));
+        assert_eq!(app.overlay, Overlay::Options { tab: 1, selected: 0 });
+        draw_now(&mut app);
+        click_on(&mut app, Hit::OptionsTab(0));
+        draw_now(&mut app);
+        assert_eq!(app.overlay, Overlay::Options { tab: 0, selected: 0 });
+
+        // A single click on a row only selects it.
+        let stars_row = OPTION_TABS[0].items.iter().position(|i| *i == OptionItem::GithubStars).unwrap();
+        let before = app.config.show_stars;
+        click_on(&mut app, Hit::Option(stars_row));
+        assert_eq!(app.overlay, Overlay::Options { tab: 0, selected: stars_row });
+        assert_eq!(app.config.show_stars, before);
+
+        // Clicking the value changes it, like Enter.
+        draw_now(&mut app);
+        click_on(&mut app, Hit::OptionValue(stars_row));
+        assert_ne!(app.config.show_stars, before);
+
+        // A quick second click on a row (a double click) changes it too.
+        draw_now(&mut app);
+        let anim_row = OPTION_TABS[0].items.iter().position(|i| *i == OptionItem::Animation).unwrap();
+        let animation = app.config.banner_animation;
+        let rect = rect_of(&app, Hit::Option(anim_row));
+        for _ in 0..2 {
+            send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), rect.x + 2, rect.y);
+        }
+        assert_ne!(app.config.banner_animation, animation);
+        assert_eq!(app.overlay, Overlay::Options { tab: 0, selected: anim_row });
+    }
+
+    #[test]
+    fn two_slow_clicks_on_an_option_do_not_change_it() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_options(&mut app);
+        let row = OPTION_TABS[0].items.iter().position(|i| *i == OptionItem::Animation).unwrap();
+        let animation = app.config.banner_animation;
+        let rect = rect_of(&app, Hit::Option(row));
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), rect.x + 2, rect.y);
+        std::thread::sleep(DOUBLE_CLICK + Duration::from_millis(60));
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), rect.x + 2, rect.y);
+        assert_eq!(app.config.banner_animation, animation);
+    }
+
+    #[test]
+    fn options_wheel_moves_the_selection_and_a_click_outside_goes_back() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_options(&mut app);
+        wheel(&mut app, true);
+        assert_eq!(app.overlay, Overlay::Options { tab: 0, selected: 1 });
+        wheel(&mut app, false);
+        assert_eq!(app.overlay, Overlay::Options { tab: 0, selected: 0 });
+
+        // Outside the Options frame: like Esc, back to the menu.
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert!(matches!(app.overlay, Overlay::Menu { .. }), "{:?}", app.overlay);
+    }
+
+    #[test]
+    fn clicking_a_theme_applies_it_and_the_wheel_previews() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_options(&mut app);
+        click_on(&mut app, Hit::Option(0)); // Theme row, selected
+        draw_now(&mut app);
+        click_on(&mut app, Hit::OptionValue(0)); // opens the theme chooser
+        draw_now(&mut app);
+        let Overlay::Themes { original, .. } = app.overlay else {
+            panic!("expected the theme chooser, got {:?}", app.overlay);
+        };
+
+        wheel(&mut app, true);
+        assert_ne!(app.theme().name, original, "the wheel previews the next theme");
+        draw_now(&mut app);
+
+        let target = ThemeName::ALL[3];
+        click_on(&mut app, Hit::Theme(3));
+        assert_eq!(app.theme().name, target);
+        assert!(!matches!(app.overlay, Overlay::Themes { .. }));
+    }
+
+    #[test]
+    fn outline_rows_are_clickable_and_a_click_outside_closes_it() {
+        let dir = project();
+        let mut app = app(&dir);
+        press(&mut app, KeyCode::Char('o'));
+        draw_now(&mut app);
+        click_on(&mut app, Hit::Outline(1));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.viewer.cursor > 0, "jumped to the second heading");
+
+        press(&mut app, KeyCode::Char('o'));
+        draw_now(&mut app);
+        let cursor = app.viewer.cursor;
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.viewer.cursor, cursor, "closing does not jump");
+    }
+
+    #[test]
+    fn help_scrolls_with_the_wheel_and_closes_on_an_outside_click() {
+        let dir = project();
+        let mut app = app(&dir);
+        press(&mut app, KeyCode::Char('?'));
+        draw_now(&mut app);
+        wheel(&mut app, true);
+        let Overlay::Help { scroll } = app.overlay else { panic!() };
+        assert_eq!(scroll, WHEEL_LINES as usize);
+        wheel(&mut app, false);
+        assert_eq!(app.overlay, Overlay::Help { scroll: 0 });
+        // Inside the help: nothing. Outside: closes.
+        let panel = rect_of(&app, Hit::Panel);
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), panel.x + 3, panel.y + 3);
+        assert!(matches!(app.overlay, Overlay::Help { .. }));
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn links_chooser_rows_are_clickable() {
+        let (_dir, mut app) = linked(&[
+            ("README.md", "# Home\n\n[a](a.md) [b](b.md)\n"),
+            ("a.md", "# A\n"),
+            ("b.md", "# B\n"),
+        ]);
+        goto_link(&mut app, "a.md");
+        press(&mut app, KeyCode::Char(' '));
+        draw_now(&mut app);
+        click_on(&mut app, Hit::Link(1));
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(open_name(&app), "b.md");
+    }
+
+    #[test]
+    fn with_the_mouse_option_off_menus_ignore_clicks_and_the_wheel() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_menu(&mut app);
+        app.config.mouse = false;
+        let start = app.overlay;
+        click_on(&mut app, Hit::MenuItem(2));
+        wheel(&mut app, true);
+        assert_eq!(app.overlay, start);
+        assert!(!app.should_quit);
+    }
+
+    // ------------------------------------------------------------ explorer
+
+    fn explorer_row(app: &App, name: &str) -> (u16, u16) {
+        let position = app
+            .explorer
+            .visible()
+            .iter()
+            .position(|&i| app.explorer.tree.node(i).unwrap().name == name)
+            .unwrap_or_else(|| panic!("{name} not visible"));
+        let rect = app.layout.explorer.unwrap();
+        (rect.x, rect.y + (position - app.explorer.offset()) as u16)
+    }
+
+    #[test]
+    fn the_chevron_folds_a_folder_without_changing_the_document() {
+        let dir = project();
+        let mut app = app(&dir);
+        draw_now(&mut app);
+        let open_before = open_name(&app);
+        let (x, y) = explorer_row(&app, "notes");
+        let notes = app.explorer.tree.find_path(&dir.path().join("notes")).unwrap();
+        assert!(!app.explorer.tree.is_expanded(notes));
+        let (start, _) = crate::ui::explorer::chevron_columns(
+            app.explorer.tree.node(notes).unwrap(),
+            app.config.icon_style(),
+        )
+        .unwrap();
+
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + start, y);
+        assert!(app.explorer.tree.is_expanded(notes), "expanded by the chevron");
+        assert_eq!(open_name(&app), open_before, "the document did not change");
+        assert_eq!(app.focus, Focus::Explorer);
+
+        draw_now(&mut app);
+        let (x, y) = explorer_row(&app, "notes");
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + start + 1, y);
+        assert!(!app.explorer.tree.is_expanded(notes), "folded again");
+    }
+
+    #[test]
+    fn the_chevron_columns_match_what_is_drawn() {
+        let dir = project();
+        fs::create_dir_all(dir.path().join("notes/deeper")).unwrap();
+        fs::write(dir.path().join("notes/deeper/x.md"), "x\n").unwrap();
+        let mut app = app(&dir);
+        let notes = app.explorer.tree.find_path(&dir.path().join("notes")).unwrap();
+        app.explorer.tree.expand(notes);
+        app.explorer.refresh();
+        let deeper = app.explorer.tree.find_path(&dir.path().join("notes/deeper")).unwrap();
+        app.explorer.tree.expand(deeper);
+        app.explorer.refresh();
+        let text = draw_now(&mut app);
+        for name in ["notes", "deeper"] {
+            let (x, y) = explorer_row(&app, name);
+            let node = app
+                .explorer
+                .tree
+                .node(app.explorer.tree.find_path(&dir.path().join(if name == "notes" { "notes" } else { "notes/deeper" })).unwrap())
+                .unwrap();
+            let (start, width) = crate::ui::explorer::chevron_columns(node, app.config.icon_style()).unwrap();
+            let row: Vec<char> = text.lines().nth(y as usize).unwrap().chars().collect();
+            let drawn: String = row[(x + start) as usize..(x + start + width) as usize].iter().collect();
+            assert!(drawn.starts_with('▾') || drawn.starts_with('▸'), "{name}: {drawn:?} in {:?}", row.iter().collect::<String>());
+        }
+        // The root and files have no chevron.
+        let root = app.explorer.tree.node(app.explorer.tree.root_index()).unwrap();
+        assert!(crate::ui::explorer::chevron_columns(root, app.config.icon_style()).is_none());
+    }
+
+    #[test]
+    fn clicking_a_name_selects_and_double_clicking_opens_or_folds() {
+        let dir = project();
+        let mut app = app(&dir);
+        draw_now(&mut app);
+        app.focus = Focus::Explorer;
+
+        // A single click on a file previews it and keeps focus in the tree.
+        let (x, y) = explorer_row(&app, "plain.txt");
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 8, y);
+        assert_eq!(open_name(&app), "plain.txt");
+        assert_eq!(app.focus, Focus::Explorer);
+        assert!(app.history.is_empty());
+
+        // The second click of a double click opens it for reading.
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 8, y);
+        assert_eq!(app.focus, Focus::Viewer);
+
+        // A double click on a folder folds it; a single click only selects.
+        draw_now(&mut app);
+        app.focus = Focus::Explorer;
+        let notes = app.explorer.tree.find_path(&dir.path().join("notes")).unwrap();
+        let (x, y) = explorer_row(&app, "notes");
+        std::thread::sleep(DOUBLE_CLICK + Duration::from_millis(60));
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 8, y);
+        assert!(!app.explorer.tree.is_expanded(notes));
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 8, y);
+        assert!(app.explorer.tree.is_expanded(notes));
+    }
+
+    #[test]
+    fn clicks_below_the_last_row_do_nothing_and_text_selection_still_works() {
+        let dir = project();
+        let mut app = app(&dir);
+        draw_now(&mut app);
+        let selected = app.explorer.selected_position();
+        let rect = app.layout.explorer.unwrap();
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), rect.x + 3, rect.bottom() - 1);
+        assert_eq!(app.explorer.selected_position(), selected);
+
+        // Drag in the viewer still starts and ends a selection.
+        let viewer = app.layout.viewer;
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), viewer.x + 2, viewer.y + 1);
+        send_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), viewer.x + 12, viewer.y + 1);
+        assert!(app.selection.is_some());
+        send_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), viewer.x + 12, viewer.y + 1);
+        assert!(app.selection.as_ref().is_some_and(|s| s.done));
+    }
+
+    #[test]
+    fn explorer_clicks_do_nothing_with_the_mouse_off() {
+        let dir = project();
+        let mut app = app(&dir);
+        draw_now(&mut app);
+        app.config.mouse = false;
+        let (x, y) = explorer_row(&app, "plain.txt");
+        let before = open_name(&app);
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 8, y);
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 8, y);
+        assert_eq!(open_name(&app), before);
     }
 }

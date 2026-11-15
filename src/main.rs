@@ -6,6 +6,7 @@
 //! under the platform configuration directory.
 
 mod app;
+mod browser;
 mod clipboard;
 mod config;
 mod editor;
@@ -15,6 +16,7 @@ mod keymap;
 mod markdown;
 mod selection;
 mod stars;
+mod trace;
 mod ui;
 mod viewer;
 
@@ -54,9 +56,11 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    trace::init();
     let cli = Cli::parse();
+    trace::mark("cli parsed");
 
-    let mut config = Config::load();
+    let mut config = trace::span("config load", Config::load);
     if let Some(theme) = &cli.theme {
         let Some(name) = ThemeName::from_slug(theme) else {
             let available = ThemeName::ALL
@@ -76,9 +80,11 @@ fn main() -> Result<()> {
         config.set_icon_style(style);
     }
 
-    let mut app = App::with_config(cli.path.as_deref(), config);
+    let mut app = trace::span("App::with_config (total)", || {
+        App::with_config(cli.path.as_deref(), config)
+    });
 
-    let mut terminal = ratatui::init();
+    let mut terminal = trace::span("terminal init", ratatui::init);
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
     let result = event_loop(&mut terminal, &mut app);
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
@@ -88,14 +94,22 @@ fn main() -> Result<()> {
     if result.is_ok() {
         app.persist();
     }
+    if let Some(destination) = trace::destination() {
+        eprintln!("rtui: start-up trace written to {destination}");
+    }
     result
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let mut mouse_captured = false;
+    let mut first_draw = true;
     loop {
         app.tick();
         terminal.draw(|frame| ui::draw(frame, app))?;
+        if first_draw {
+            first_draw = false;
+            trace::mark("first draw finished");
+        }
         // The shell starts once the first draw has computed the layout.
         app.ensure_terminal();
 
@@ -115,7 +129,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
             let mut out = std::io::stdout();
             let _ = out.write_all(clipboard::osc52(&text).as_bytes());
             let _ = out.flush();
-            app.set_status(format!("Copied {} characters", text.chars().count()));
+            let message = app.copy_status(&text);
+            app.set_status(message);
         }
 
         let timeout = if app.menu_animation().is_some() {
@@ -124,6 +139,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
             events::EDITOR_TICK
         } else if app.term.is_some() && app.layout.terminal.is_some() {
             events::TERMINAL_TICK
+        } else if app.is_busy() {
+            events::SPINNER_TICK
         } else {
             events::TICK
         };
