@@ -8,7 +8,7 @@ document outline, live reload, optional editing with your `$EDITOR`, and syntax
 highlighting in nine colour themes.
 
 ```
-┌ runetui ─────────────────────────────────────────────────────────────────┐
+┌ runetui ──────────────────────────────────────────────────────────────────┐
 │ PROJECT                    │ notes/architecture.md             markdown   │
 │ ▾ notes                    │                                              │
 │   ▸ daily                  │ # Architecture                               │
