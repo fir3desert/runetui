@@ -13,6 +13,7 @@ mod editor;
 mod events;
 mod filesystem;
 mod keymap;
+mod launcher;
 mod markdown;
 mod selection;
 mod stars;

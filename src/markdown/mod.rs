@@ -26,9 +26,29 @@ pub struct RenderedDoc {
     pub lines: Vec<RLine>,
     pub headings: Vec<Heading>,
     pub links: Vec<DocLink>,
+    /// Fenced/indented code blocks, so Enter or Space on one can copy it.
+    pub code_blocks: Vec<CodeRegion>,
+}
+
+/// A code block's place in the rendered document and its raw source text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodeRegion {
+    /// First rendered row of the block (its top border, when it has a frame).
+    pub start: usize,
+    /// One past the last rendered row of the block.
+    pub end: usize,
+    /// The code exactly as written, without the frame or the highlighting.
+    pub code: String,
 }
 
 impl RenderedDoc {
+    /// The code block that covers rendered row `line`, if any.
+    pub fn code_block_at(&self, line: usize) -> Option<&CodeRegion> {
+        self.code_blocks
+            .iter()
+            .find(|region| line >= region.start && line < region.end)
+    }
+
     /// Link (if any) located on `line`.  The first link wins; that matches the
     /// "press Enter on the current line" interaction.
     #[cfg(test)]

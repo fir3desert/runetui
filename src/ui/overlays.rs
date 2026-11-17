@@ -15,6 +15,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Overlay::Help { scroll } => render_help(frame, area, app, scroll),
         Overlay::Outline { selected } => render_outline(frame, area, app, selected),
         Overlay::Links { selected } => render_links(frame, area, app, selected),
+        Overlay::FileMenu { selected } => render_file_menu(frame, area, app, selected),
         Overlay::Themes { selected, .. } => {
             crate::ui::menu::render_themes(frame, area, app, selected);
         }
@@ -229,6 +230,72 @@ fn render_links(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
     ));
     let paragraph = Paragraph::new(lines)
         .block(popup_block(&theme, "Links on this line").title_bottom(hint))
+        .style(Style::default().bg(theme.bg).fg(theme.fg));
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(paragraph, rect);
+    app.record_hit(rect, Hit::Panel);
+}
+
+/// Actions for the file or folder selected in the explorer (Enter).
+fn render_file_menu(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
+    let Some(menu) = app.file_menu.as_ref() else {
+        return;
+    };
+    if area.width < 24 || area.height < 6 {
+        return;
+    }
+    let theme = app.theme();
+    let width = area.width.saturating_sub(8).min(44).max(24);
+    let height = area.height.saturating_sub(2).min(menu.actions.len() as u16 + 2);
+    let rect = centered(area, width, height);
+    let inner_width = width.saturating_sub(2) as usize;
+    let inner_height = height.saturating_sub(2) as usize;
+    let offset = selected.saturating_sub(inner_height.saturating_sub(1));
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_height);
+    for (index, action) in menu.actions.iter().enumerate().skip(offset).take(inner_height) {
+        let is_selected = index == selected;
+        app.record_hit(
+            Rect::new(rect.x + 1, rect.y + 1 + lines.len() as u16, rect.width.saturating_sub(2), 1),
+            Hit::FileAction(index),
+        );
+        let number = if index < 9 { format!("{} ", index + 1) } else { "  ".to_string() };
+        let label = action.label(menu.is_dir);
+        let used = 2 + 2 + label.chars().count();
+        let mut line = Line::from(vec![
+            Span::styled(
+                if is_selected { "▍ " } else { "  " },
+                Style::default().fg(if is_selected { theme.accent } else { theme.bg }),
+            ),
+            Span::styled(number, Style::default().fg(theme.fg_muted)),
+            Span::styled(
+                label.to_string(),
+                if is_selected {
+                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.fg_dim)
+                },
+            ),
+            Span::raw(" ".repeat(inner_width.saturating_sub(used))),
+        ]);
+        if is_selected {
+            line = line.style(Style::default().bg(theme.bg_sel));
+        }
+        lines.push(line);
+    }
+
+    let title: String = {
+        let kind = if menu.is_dir { "Folder" } else { "File" };
+        let name: String = menu.name.chars().take(width.saturating_sub(12) as usize).collect();
+        format!("{kind}: {name}")
+    };
+    let hint = Line::from(Span::styled(
+        " Enter run · 1-9 pick · Esc close ",
+        Style::default().fg(theme.fg_muted),
+    ));
+    let paragraph = Paragraph::new(lines)
+        .block(popup_block(&theme, &title).title_bottom(hint))
         .style(Style::default().bg(theme.bg).fg(theme.fg));
 
     frame.render_widget(Clear, rect);

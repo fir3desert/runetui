@@ -31,12 +31,16 @@ highlighting in nine colour themes.
   the explorer on narrow terminals and reflows the document on resize.
 - **Project explorer** — lazy directory tree, expand/collapse, per-extension
   icons, hidden-file toggle, optional `.gitignore` filtering, optional last
-  directory memory, a clear selection indicator, and automatic file preview while you
-  move through the tree with the arrow keys.
-- **Markdown rendering** — headings H1–H6, bold/italic/strikethrough, ordered
-  and unordered lists (nested), task lists, tables with alignment, blockquotes
-  and callouts, links, horizontal rules, inline code, footnotes, definition
-  lists, and fenced code blocks.
+  directory memory, a clear selection indicator, automatic file preview while
+  you move through the tree with the arrow keys, and an `Enter` actions menu to
+  open a file elsewhere (VS Code, a new terminal, the default app), edit it, or
+  copy its path or name.
+- **Markdown rendering** — headings H1–H6, bold/italic/strikethrough,
+  superscript/subscript, ordered and unordered lists (nested), task lists,
+  tables with alignment, blockquotes and callouts, links, horizontal rules,
+  inline code, inline math (styled source, not typeset), footnotes, definition
+  lists, YAML and `+++` metadata blocks, heading attributes, and fenced code
+  blocks.
 - **Real syntax highlighting** — [syntect](https://github.com/trishume/syntect)
   with a palette-derived theme, per-block language labels, automatic language
   detection, and token highlighting for code blocks and standalone source files.
@@ -52,14 +56,14 @@ highlighting in nine colour themes.
 - **Integrated terminal** — a shell panel under the document (`Ctrl+T` to show or
   hide it) with scrollback, resizable together with the explorer through a
   tmux-style `Ctrl+R` prefix.
-- **Configurable shortcuts** — every global key lives in the `[keys]` table of
-  `config.toml`, including the prefix key.
+- **Configurable shortcuts** — every global key except `q` (which always quits)
+  lives in the `[keys]` table of `config.toml`, including the prefix key.
 - **Pane-limited mouse selection** — drag to select and copy text from the
   document, editor or terminal without grabbing the explorer or the borders.
 - **btop-style Esc menu** — `Esc` opens a menu over the live interface (it is
-  dimmed, not cleared) with a block-letter banner and OPTIONS / HELP / QUIT, like
-  btop and mctui. OPTIONS has tabs (General, Explorer, Editor, Terminal) with a
-  description of each setting.
+  dimmed, not cleared, except for the header's kind/progress/stars group) with a
+  block-letter banner and OPTIONS / HELP / QUIT, like btop and mctui. OPTIONS has
+  tabs (General, Explorer, Editor, Terminal) with a description of each setting.
 - **Nine themes** — Catppuccin Mocha (default), Tokyo Night, Nord, Dracula,
   Gruvbox, Black, White, Snow, and Default Dark. Code highlighting follows the
   active palette. The Black, White, and Snow palettes are inspired by btop.
@@ -88,20 +92,7 @@ install -m 755 target/release/rtui ~/.local/bin/rtui
 The package name is `runetui`, but the installed command is the shorter
 `rtui`.
 
-### Prebuilt binary (Linux x86_64)
-
-The distribution ZIP includes a stripped `rtui` binary for 64-bit Linux next to
-the source tree. It needs a glibc-based system:
-
-```sh
-chmod +x rtui
-./rtui
-```
-
-The binary does not need the Rust toolchain. Build from source as shown above on
-other platforms.
-
-Run the tests with:
+### Run the tests
 
 ```sh
 cargo test
@@ -132,10 +123,10 @@ rtui ~/notes/today.md    # open a project and select the file
 rtui -t nord ~/notes     # start with a specific theme
 ```
 
-When no path is given, runetui restores the last project directory from its
-configuration. In a fresh directory it opens the current working directory and
-automatically previews `README.md` if one exists; otherwise it shows a welcome
-screen.
+When no path is given, runetui opens the current working directory; with
+`reopen_last_directory = true` it restores instead the last project directory
+saved in the configuration. In either case it automatically previews `README.md`
+if one exists; otherwise it shows a welcome screen.
 
 ### Command-line options
 
@@ -147,9 +138,11 @@ screen.
 | `-h`, `--help` | Show help. |
 | `-V`, `--version` | Show the version. |
 
-Invalid theme names produce an error listing the available themes. Settings
-changed during a session (theme, explorer width, hidden-file and `.gitignore`
-toggles, last directory) are saved on a clean exit.
+Theme names are case-insensitive and also accept underscores or the full label
+(for example `tokyo_night` or `Catppuccin Mocha`). Invalid theme names produce an
+error listing the available themes. Settings changed during a session (theme,
+explorer width, hidden-file and `.gitignore` toggles, last directory) are saved
+on a clean exit.
 
 ## Key bindings
 
@@ -183,8 +176,9 @@ use that key themselves (bash reverse search, vim redo): press the prefix twice 
 send it through, or pick another one with `prefix = "ctrl+a"` in `config.toml`.
 
 The `Esc` menu darkens the interface behind it (colours are blended towards black,
-as in btop, so it stays readable) and its logo plays a short light-sweep and
-shimmer animation each time it is opened with `Esc`.
+as in btop, so it stays readable), except for the header's kind/progress/stars
+group, which stays bright; its logo plays a short light-sweep and shimmer
+animation each time it is opened with `Esc`.
 
 The terminal panel runs `$SHELL` in the project directory. It keeps running
 while hidden, closes when the shell exits, and its title bar and left gutter
@@ -218,11 +212,12 @@ exist (every action has a keyboard equivalent).
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` | Move selection; the highlighted file is previewed automatically |
-| `Space` / `Enter` | Open the file and focus the document, or expand/collapse a folder |
+| `Space` | Open the file and focus the document, or expand/collapse a folder |
+| `Enter` | Actions menu for the selected file or folder: open, **open in VS Code**, **open in a new terminal** (in the folder, or the file's folder), open with the default app, edit, copy path / name. Pick with `↑`/`↓` + `Enter`, a number, or a click; `Esc` closes it |
 | `←` / `→` | Collapse a folder or jump to its parent / expand a folder or descend into it |
 | `Home` / `End` | Jump to the first / last entry |
-| `PageUp` / `PageDown` | Move a page up / down |
-| `e` | Edit the selected file in the pane with `$VISUAL`, `$EDITOR`, or `vim` |
+| `PageUp` / `PageDown` | Move a page up / down (`Ctrl+F` also pages down) |
+| `e` / `Ctrl+E` | Edit the selected file in the pane with `$VISUAL`, `$EDITOR`, or `vim` |
 | `H` | Toggle hidden files |
 | `I` | Toggle `.gitignore` filtering |
 | `r` | Refresh the project tree |
@@ -235,15 +230,15 @@ exist (every action has a keyboard equivalent).
 | `↑` / `↓` | Move the cursor line down / up |
 | `Home` / `End` | Jump to the start / end |
 | `Ctrl+D` / `Ctrl+U` | Scroll half a page |
-| `PageUp` / `PageDown` | Scroll a full page up / down |
+| `PageUp` / `PageDown` (`Ctrl+F`) | Scroll a full page up / down (`Ctrl+F` is another page-down) |
 | `←` | Return focus to the explorer |
-| `Space` (`follow_link`) | Follow the link on the cursor line (`Enter` does the same). Several links on the line open a small chooser (`↑`/`↓`, `Enter` or `1`–`9`, `Esc` to cancel) |
-| `Enter` | Follow a link, anchor, or `[[wikilink]]` |
+| `Space` (`follow_link`) | Follow the link on the cursor line (`Enter` does the same). On a code block, both copy the whole block. Several links on the line open a small chooser (`↑`/`↓`, `Enter` or `1`–`9`, `Esc` to cancel) |
+| `Enter` | Follow a link, anchor, or `[[wikilink]]`; on a code block, copy it |
 | `/` | Search the document (case-insensitive) |
 | `n` / `N` | Next / previous search match |
 | `o` | Open the document outline |
 | `Ctrl+O` / `Ctrl+I` | History back / forward |
-| `e` | Edit the current file inside runetui (vim in the pane) |
+| `e` / `Ctrl+E` | Edit the current file inside runetui (vim in the pane) |
 | `r` | Reload the document and refresh the tree |
 
 Following a link never runs anything. A relative link (`notes/guide.md`,
@@ -253,8 +248,10 @@ to the heading; `http(s)` and `mailto:` links go to the browser (`xdg-open`,
 `open`, or `rundll32 url.dll,FileProtocolHandler`, passed as one argument and
 never through a shell; without a browser the address is copied with OSC 52 and
 the status bar says so). Any other scheme (`file:`, `javascript:`, `ftp:`…) is
-refused, and so is a path that resolves, through `..` or a symlink, to
-somewhere outside the project root. A missing target is reported in the status
+refused, and so is a relative path that resolves, through `..` or a symlink, to
+somewhere outside the project root. `[[wikilinks]]` are resolved by name inside
+the project tree and are not subject to that path check, so only open documents
+you trust. A missing target is reported in the status
 bar. In the explorer `Space` still opens files and folds folders, in the
 search prompt, the editor and the terminal it is an ordinary space, and on a
 line without a link it does nothing. Rebind it with `follow_link` in `[keys]`.
@@ -267,8 +264,9 @@ included) goes to it, and the pane closes when you quit it.
 | --- | --- |
 | `Esc` | Open the Esc menu (OPTIONS / HELP / QUIT) over the live interface, or go back / close an overlay, prompt or search |
 | `T` | Cycle the colour theme |
-| `?` | Show or hide help |
-| `q` | Quit (also `Ctrl+C`) |
+| `?` / `prefix ?` | Show or hide help |
+| `q` | Quit (the only way out: `Ctrl+C` does nothing) |
+| `Enter` / `Space` | On a link: follow it. On a code block: copy the whole block to the clipboard |
 
 Pressing `Esc` with no overlay open brings up the menu. `↑`/`↓` (or `j`/`k`)
 select OPTIONS, HELP or QUIT and `Enter` opens it; `Esc` goes back one level.
@@ -277,9 +275,10 @@ In OPTIONS, `←`/`→` change tab, `Enter` changes the highlighted setting, and
 `Esc` restores the previous one. Choices are saved in `config.toml`.
 
 The menu and the theme picker are drawn over the running interface, which is
-only dimmed, so you can see the explorer, document and terminal behind them (and
-the theme change live). The `RuneTUI` banner keeps fixed brand colours whatever
-the theme. *Explorer width* and *Terminal height* are adjusted from the Options
+only dimmed (the header's kind/progress/stars group is left bright), so you can
+see the explorer, document and terminal behind them (and the theme change live).
+The `RuneTUI` banner keeps fixed brand colours whatever the theme. *Explorer
+width* and *Terminal height* are adjusted from the Options
 screen with `Enter`, then `+` / `-`, then `Enter` or `Esc` when done.
 
 The search prompt accepts text and supports `Backspace`; `Ctrl+U` clears the
@@ -298,8 +297,9 @@ input. `Enter` runs the search and `Esc` cancels it.
 
 YAML front matter is hidden from the rendered document. Markdown features are
 parsed with [pulldown-cmark](https://github.com/raphlinus/pulldown-cmark),
-including GFM tables, task lists, strikethrough, footnotes, definition lists,
-metadata blocks, and wikilinks.
+including GFM tables, task lists, strikethrough, super/subscript, inline math,
+footnotes, definition lists, YAML and `+++` metadata blocks, heading attributes,
+and wikilinks.
 
 ## Themes
 
@@ -350,7 +350,6 @@ banner_animation = true
 show_stars = true
 
 [keys]
-quit = ["q", "ctrl+c", "prefix q"]
 toggle_terminal = ["ctrl+t", "prefix t"]
 explorer_shrink = ["prefix left", "ctrl+left", "<"]
 # ...one entry per action; the file lists all of them
@@ -362,7 +361,8 @@ explorer_shrink = ["prefix left", "ctrl+left", "<"]
 ### GitHub stars
 
 The header shows the star count of the repository at the far right
-(`markdown  0%  ★ 42`: kind, progress, stars). Clicking it opens
+(`markdown  0%  ★ 42`: kind, progress, stars; counts from 1000 are abbreviated,
+e.g. `★ 1.2k`). Clicking it opens
 <https://github.com/fir3desert/runetui>. The count is the only network request
 runetui makes itself: the
 system `curl` asks the GitHub API once an hour in the background (the count is
@@ -375,9 +375,12 @@ request and hide the count. On narrow terminals it is the first item dropped.
 The badge in the header says what the viewer is showing: `welcome` before any
 document is open, `markdown`, a language (`rust`, `makefile`…), `binary`, and for
 plain text `text` (`.txt`) or `text · <extension or name>` (`text · .rst`,
-`text · .gitignore`, `text · LICENSE`). A name is only treated as code when
-syntect's bundled syntaxes really have one for it (`Makefile` does;
-`.gitignore`, `Dockerfile`, `.env`, `LICENSE` and `toml` do not).
+`text · .gitignore`, `text · LICENSE`). A file with an extension is labelled as
+code from that extension (`Cargo.toml` shows `toml`); extensionless files are
+checked against syntect's bundled syntaxes and their shebang (`Makefile` and a
+`#!/bin/sh` script are recognised, `LICENSE` is shown as text). Token
+highlighting can still fall back to plain text when syntect has no matching
+syntax.
 
 ### Diagnosing a slow start
 
@@ -388,12 +391,14 @@ directory listing) to `rtui-trace.log` in the system temporary directory;
 
 ### Shortcuts
 
-Every global shortcut is listed in the `[keys]` table and can be rebound with a
-single key or a list of them. A binding is one key (`"ctrl+t"`, `"T"`, `"f5"`,
-`"alt+x"`, `"esc"`, `"shift+tab"`) or two keys separated by a space
-(`"ctrl+x b"`); the word `prefix` stands for the `prefix` key. Missing or invalid
-entries fall back to their defaults, with a message in the status bar. Actions:
-`quit`, `menu`, `help`, `outline`, `follow_link`, `search`, `search_next`, `search_prev`,
+Every global shortcut except `q` is listed in the `[keys]` table and can be
+rebound with a single key or a list of them. Quitting is deliberately fixed:
+`q` always quits, a `quit` entry in the configuration is ignored, and `Ctrl+C`
+does nothing. A binding is one key (`"ctrl+t"`, `"T"`, `"f5"`, `"alt+x"`,
+`"esc"`, `"shift+tab"`) or two keys separated by a space (`"ctrl+x b"`); the word
+`prefix` stands for the `prefix` key. Missing or invalid entries fall back to
+their defaults, with a message in the status bar. Actions:
+`menu`, `help`, `outline`, `follow_link`, `search`, `search_next`, `search_prev`,
 `focus_next`, `focus_prev`, `edit`, `toggle_explorer`, `toggle_terminal`,
 `cycle_theme`, `toggle_hidden`, `toggle_gitignore`, `cycle_icons`, `refresh`,
 `history_back`, `history_forward`, `half_page_down`, `half_page_up`, `page_down`,
@@ -402,8 +407,9 @@ entries fall back to their defaults, with a message in the status bar. Actions:
 are fixed; `Space` is `follow_link` in the document and always opens/folds in
 the explorer.
 Missing fields fall back to defaults, and a malformed configuration never
-prevents documents from being read. There are no other files on disk owned by
-runetui.
+prevents documents from being read. The only files runetui writes itself are
+`config.toml`, the star-count cache (`stars.txt` under the platform cache
+directory) and, when tracing is enabled, the trace log described above.
 
 ## Architecture
 
@@ -411,19 +417,27 @@ runetui.
 src/
 ├── main.rs                     CLI, terminal lifecycle, event loop
 ├── app.rs                      Application state, key handling, navigation, persistence
+├── browser.rs                  Safe external URL opener
+├── clipboard.rs                OSC 52 clipboard copy
 ├── config.rs                   Settings and startup path resolution
 ├── editor.rs                   Embedded editor: vim in a pseudo-terminal, key encoding
-├── events.rs                   Crossterm input with a 100 ms tick (12 ms while editing)
+├── events.rs                   Crossterm input: 100 ms tick, 12 ms while editing or
+│                               in the terminal, plus terminal/animation/spinner ticks
 ├── filesystem/
 │   ├── tree.rs                 Lazy arena tree, background listings, hidden/.gitignore filtering
 │   ├── explorer.rs             Selection, viewport, expansion, width
 │   └── watcher.rs              Background non-recursive notify watcher
+├── keymap.rs                   Configurable bindings and prefix chords
+├── launcher.rs                 Open files in VS Code, a terminal window or the default app
 ├── markdown/
 │   ├── parser.rs               pulldown-cmark events → owned document AST
 │   ├── renderer.rs             Width-aware layout into styled lines
 │   ├── code_highlighter.rs     syntect integration and language labels
 │   ├── toc.rs                  Outline and anchor resolution
 │   └── mod.rs                  Rendered document types and slugification
+├── selection.rs                Pane-limited mouse selection
+├── stars.rs                    Cached GitHub star count
+├── trace.rs                    Optional startup tracing
 ├── viewer/
 │   ├── mod.rs                  Loading, caching, scrolling, search, history
 │   ├── text.rs                 Plain-text and source-file views
@@ -439,7 +453,8 @@ src/
     ├── markdown.rs             Document lines with cursor/search overlays
     ├── statusbar.rs            Status and search prompt
     ├── bar.rs                  Shared bar layout
-    ├── overlays.rs             Outline popup
+    ├── overlays.rs             Outline, link and file-action popups
+    ├── terminal.rs             Embedded shell pane
     └── help.rs                 Help overlay content
 ```
 
@@ -469,8 +484,9 @@ runetui reads documents into memory and never modifies them by itself:
 - Links never execute anything: only documents inside the project and
   `http(s)`/`mailto:` addresses (handed to the system opener as a single
   argument) are followed.
-- runetui itself only writes `config.toml` under the platform configuration
-  directory.
+- runetui itself only writes its settings (`config.toml` under the platform
+  configuration directory), a cached star count under the platform cache
+  directory, and an optional trace log when `RTUI_TRACE` is set.
 
 ## Limitations
 

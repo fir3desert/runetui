@@ -25,6 +25,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.set_terminal_area(area);
     app.star_rect.set(None);
+    app.header_keep.set(None);
     app.hits.borrow_mut().clear();
     let theme = app.theme();
 
@@ -704,6 +705,48 @@ mod tests {
             // One blank column of margin after the stars, as before.
             assert!(top.ends_with("★ 1.2k "), "{top:?}");
         }
+    }
+
+    #[test]
+    fn the_header_shows_the_clock_in_the_middle() {
+        let dir = project();
+        let mut app = app(&dir);
+        let top = header_row(&mut app, 120);
+        let at = top.find(':').expect("clock in the header");
+        // HH:MM:SS, centred (the colon after the hours is at column 57 or so).
+        let first = at - 2;
+        let clock = &top[first..first + 8];
+        assert!(clock.chars().enumerate().all(|(i, c)| if i == 2 || i == 5 { c == ':' } else { c.is_ascii_digit() }), "{clock:?}");
+        let middle = first + 4;
+        assert!((58..=62).contains(&middle), "centred: {middle} in {top:?}");
+        // Too narrow for it: the clock gives way instead of touching the rest.
+        let narrow = header_row(&mut app, 30);
+        assert!(!narrow.contains(':'), "{narrow:?}");
+    }
+
+    #[test]
+    fn the_esc_menu_leaves_the_top_right_corner_as_it_was() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.stars.set_for_test(crate::stars::StarsState::Count(1234));
+        let corner = |app: &mut App| -> Vec<(String, ratatui::style::Color, ratatui::style::Color)> {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let from = app.header_keep.get().expect("right group drawn").x;
+            (from..120u16)
+                .map(|x| {
+                    let cell = &buffer[(x, 0)];
+                    (cell.symbol().to_string(), cell.fg, cell.bg)
+                })
+                .collect()
+        };
+        let before = corner(&mut app);
+        assert!(before.iter().any(|(symbol, _, _)| symbol == "%"), "{before:?}");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.finish_menu_animation();
+        assert!(matches!(app.overlay, crate::app::Overlay::Menu { .. }));
+        assert_eq!(corner(&mut app), before, "progress, kind and stars are untouched");
     }
 
     #[test]

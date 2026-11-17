@@ -83,6 +83,11 @@ pub enum Overlay {
     Links {
         selected: usize,
     },
+    /// Actions for the file or folder selected in the explorer, opened with
+    /// Enter (see `App::file_menu`).
+    FileMenu {
+        selected: usize,
+    },
     /// btop-style theme chooser. `original` is restored when the menu is
     /// cancelled with Esc.
     Themes {
@@ -118,8 +123,64 @@ pub enum Hit {
     Outline(usize),
     /// Row of the links chooser.
     Link(usize),
+    /// Row of the file actions menu.
+    FileAction(usize),
     /// The frame of a popup: a click outside every panel dismisses it.
     Panel,
+}
+
+/// What Enter on an explorer entry can do with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAction {
+    /// Open the file in the viewer, or fold/unfold the folder.
+    Open,
+    VsCode,
+    Terminal,
+    DefaultApp,
+    Edit,
+    CopyPath,
+    CopyName,
+}
+
+impl FileAction {
+    pub fn label(self, is_dir: bool) -> &'static str {
+        match self {
+            FileAction::Open if is_dir => "Expand / collapse",
+            FileAction::Open => "Open",
+            FileAction::VsCode => "Open in VS Code",
+            FileAction::Terminal => "Open in terminal",
+            FileAction::DefaultApp => "Open with default app",
+            FileAction::Edit => "Edit here",
+            FileAction::CopyPath => "Copy path",
+            FileAction::CopyName => "Copy name",
+        }
+    }
+}
+
+/// The entry the file actions menu is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMenu {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_dir: bool,
+    pub actions: Vec<FileAction>,
+}
+
+/// Programs the file actions menu starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Launch {
+    VsCode,
+    Terminal,
+    DefaultApp,
+}
+
+/// Start `program` on `path` (a folder, for the terminal).  Replaced in tests.
+fn launch_real(program: Launch, path: &Path) -> Result<(), String> {
+    match program {
+        Launch::VsCode => crate::launcher::open_in_vscode(path),
+        Launch::Terminal => crate::launcher::open_in_terminal(path),
+        Launch::DefaultApp => crate::launcher::open_with_default(path),
+    }
 }
 
 /// Two clicks this close in time and place make a double click.
@@ -272,6 +333,9 @@ pub struct App {
     started_at: Instant,
     /// Where the star count was drawn last frame, for mouse clicks.
     pub star_rect: Cell<Option<Rect>>,
+    /// Right-hand part of the header (kind, progress, stars): the Esc menu and
+    /// the other overlays leave it undimmed.
+    pub header_keep: Cell<Option<Rect>>,
     /// Clickable regions of the overlay drawn last frame.
     pub hits: std::cell::RefCell<Vec<(Rect, Hit)>>,
     /// When and where the last left click happened, for double clicks.
@@ -280,6 +344,10 @@ pub struct App {
     pub(crate) opener: fn(&str) -> Result<(), String>,
     /// The links offered by the `Overlay::Links` chooser.
     pub(crate) link_choices: Vec<DocLink>,
+    /// The entry the `Overlay::FileMenu` acts on.
+    pub(crate) file_menu: Option<FileMenu>,
+    /// Starts an external program for the file menu; replaced in tests.
+    pub(crate) launcher: fn(Launch, &Path) -> Result<(), String>,
     /// Status text that replaces "Copied N characters" for the next copy.
     clipboard_note: Option<String>,
 }
@@ -347,10 +415,13 @@ impl App {
             watcher_problem: None,
             started_at: Instant::now(),
             star_rect: Cell::new(None),
+            header_keep: Cell::new(None),
             hits: std::cell::RefCell::new(Vec::new()),
             last_click: None,
             opener: crate::browser::open_url,
             link_choices: Vec::new(),
+            file_menu: None,
+            launcher: launch_real,
             clipboard_note: None,
         };
 
@@ -1043,7 +1114,104 @@ impl App {
     /// Follow the link on the cursor line.  One link is followed at once;
     /// several open a chooser.  `quiet` (Space) says nothing when the line has
     /// no link, so the key can be tapped freely; Enter explains.
+    /// Open the actions menu for the entry selected in the explorer.
+    fn open_file_menu(&mut self) {
+        let Some(node) = self.explorer.selected_node() else {
+            return;
+        };
+        let is_dir = node.is_dir;
+        let mut actions = vec![
+            FileAction::Open,
+            FileAction::VsCode,
+            FileAction::Terminal,
+            FileAction::DefaultApp,
+        ];
+        if !is_dir {
+            actions.push(FileAction::Edit);
+        }
+        actions.push(FileAction::CopyPath);
+        actions.push(FileAction::CopyName);
+        self.file_menu = Some(FileMenu {
+            path: node.path.clone(),
+            name: node.name.clone(),
+            is_dir,
+            actions,
+        });
+        self.overlay = Overlay::FileMenu { selected: 0 };
+    }
+
+    fn close_file_menu(&mut self) {
+        self.file_menu = None;
+        self.overlay = Overlay::None;
+    }
+
+    /// Run entry `index` of the file actions menu.
+    fn choose_file_action(&mut self, index: usize) {
+        let Some(menu) = self.file_menu.clone() else {
+            self.overlay = Overlay::None;
+            return;
+        };
+        let Some(action) = menu.actions.get(index).copied() else {
+            return;
+        };
+        self.close_file_menu();
+        let shown = |what: &str| format!("{what}: {}", menu.name);
+        let launched = |app: &mut App, program: Launch, path: &Path, what: &str| {
+            match (app.launcher)(program, path) {
+                Ok(()) => app.set_status(shown(what)),
+                Err(reason) => app.set_status(format!("{what} failed ({reason})")),
+            }
+        };
+        match action {
+            FileAction::Open => {
+                self.activate();
+                self.preview_selection();
+            }
+            FileAction::VsCode => launched(self, Launch::VsCode, &menu.path, "Opened in VS Code"),
+            FileAction::Terminal => {
+                let dir = if menu.is_dir {
+                    menu.path.clone()
+                } else {
+                    menu.path.parent().map(Path::to_path_buf).unwrap_or_else(|| menu.path.clone())
+                };
+                launched(self, Launch::Terminal, &dir, "Opened a terminal in");
+            }
+            FileAction::DefaultApp => {
+                launched(self, Launch::DefaultApp, &menu.path, "Opened with the default app")
+            }
+            FileAction::Edit => self.edit_selected(),
+            FileAction::CopyPath => {
+                let text = menu.path.display().to_string();
+                self.clipboard_note = Some(format!("Copied path: {text}"));
+                self.clipboard = Some(text);
+            }
+            FileAction::CopyName => {
+                self.clipboard_note = Some(format!("Copied name: {}", menu.name));
+                self.clipboard = Some(menu.name.clone());
+            }
+        }
+    }
+
+    /// Copy the code block under the cursor.  Returns false when the cursor is
+    /// not on one, so the caller can fall back to its usual action.
+    fn copy_code_block(&mut self) -> bool {
+        let cursor = self.viewer.cursor;
+        let Some(region) = self.viewer.doc.code_block_at(cursor) else {
+            return false;
+        };
+        let code = region.code.clone();
+        let lines = code.lines().count().max(1);
+        self.clipboard_note = Some(format!(
+            "Copied code block ({lines} {})",
+            if lines == 1 { "line" } else { "lines" }
+        ));
+        self.clipboard = Some(code);
+        true
+    }
+
     fn follow_link(&mut self, quiet: bool) {
+        // A link on the line wins; otherwise a code block under the cursor is
+        // copied.
         let cursor = self.viewer.cursor;
         let mut on_line: Vec<DocLink> = self
             .viewer
@@ -1069,7 +1237,9 @@ impl App {
 
         match links.len() {
             0 => {
-                if let Some(image) = first_image {
+                if first_image.is_none() && self.copy_code_block() {
+                    // Copied: main.rs sends it to the terminal's clipboard.
+                } else if let Some(image) = first_image {
                     self.set_status(format!(
                         "Image: {} (images are not rendered)",
                         image.dest
@@ -1491,6 +1661,9 @@ impl App {
     /// Navigation keys that are not rebindable shortcuts.
     fn handle_navigation_key(&mut self, key: KeyEvent) {
         match key.code {
+            // In the explorer Enter offers actions for the entry; Space still
+            // opens files and folds folders.
+            KeyCode::Enter if self.focus == Focus::Explorer => self.open_file_menu(),
             KeyCode::Enter => self.activate(),
             KeyCode::Up => self.move_cursor(-1),
             KeyCode::Down => self.move_cursor(1),
@@ -1701,6 +1874,7 @@ impl App {
                 self.press_overlay_key(KeyCode::Enter);
             }
             (Overlay::Links { .. }, Some(Hit::Link(index))) => self.choose_link(index),
+            (Overlay::FileMenu { .. }, Some(Hit::FileAction(index))) => self.choose_file_action(index),
             (_, None) if self.outside_popups(x, y) => self.press_overlay_key(KeyCode::Esc),
             _ => {}
         }
@@ -1897,6 +2071,30 @@ impl App {
                 self.overlay = Overlay::Outline {
                     selected: next.min(count.saturating_sub(1)),
                 };
+            }
+            Overlay::FileMenu { selected } => {
+                let count = self.file_menu.as_ref().map_or(0, |menu| menu.actions.len());
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.close_file_menu(),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.overlay = Overlay::FileMenu {
+                            selected: (selected + 1).min(count.saturating_sub(1)),
+                        };
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.overlay = Overlay::FileMenu {
+                            selected: selected.saturating_sub(1),
+                        };
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => self.choose_file_action(selected),
+                    KeyCode::Char(digit @ '1'..='9') => {
+                        let index = digit as usize - '1' as usize;
+                        if index < count {
+                            self.choose_file_action(index);
+                        }
+                    }
+                    _ => {}
+                }
             }
             Overlay::Links { selected } => {
                 let count = self.link_choices.len();
@@ -2446,6 +2644,55 @@ mod tests {
             .unwrap_or_else(|| panic!("no link containing {dest_fragment}"))
     }
 
+    fn open_code_doc(app: &mut App, dir: &tempfile::TempDir) {
+        let path = dir.path().join("code.md");
+        fs::write(
+            &path,
+            b"# Code\n\nintro text\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\nafter\n",
+        )
+        .unwrap();
+        app.load_into_viewer(path, None, true);
+        app.focus = Focus::Viewer;
+    }
+
+    #[test]
+    fn enter_and_space_copy_the_code_block_under_the_cursor() {
+        let dir = project();
+        let mut app = app(&dir);
+        open_code_doc(&mut app, &dir);
+        let region = app.viewer.doc.code_blocks.first().cloned().expect("one code block");
+        assert_eq!(region.code, "fn main() {\n    println!(\"hi\");\n}");
+
+        for key in [KeyCode::Enter, KeyCode::Char(' ')] {
+            // Anywhere in the block, frame included.
+            for line in [region.start, region.start + 2, region.end - 1] {
+                app.viewer.cursor = line;
+                press(&mut app, key);
+                assert_eq!(app.take_clipboard().as_deref(), Some(region.code.as_str()), "{key:?} on row {line}");
+                assert!(app.clipboard_note.as_deref().unwrap_or("").contains("3 lines"));
+                app.clipboard_note = None;
+            }
+        }
+
+        // Outside the block nothing is copied.
+        app.viewer.cursor = 2;
+        press(&mut app, KeyCode::Enter);
+        assert!(app.take_clipboard().is_none());
+    }
+
+    #[test]
+    fn ctrl_c_does_not_quit_and_q_does() {
+        let dir = project();
+        let mut app = app(&dir);
+        for focus in [Focus::Explorer, Focus::Viewer] {
+            app.focus = focus;
+            press_ctrl(&mut app, 'c');
+            assert!(!app.should_quit, "Ctrl+C with {focus:?} focused");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
     #[test]
     fn opens_readme_on_startup() {
         let dir = project();
@@ -2472,12 +2719,151 @@ mod tests {
             app.explorer
                 .select_visible_path(&dir.path().join("plain.txt"))
         );
+        // Enter offers actions; the first one opens the file.
         press(&mut app, KeyCode::Enter);
+        assert_eq!(app.overlay, Overlay::FileMenu { selected: 0 });
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.overlay, Overlay::None);
         assert_eq!(app.focus, Focus::Viewer);
         assert_eq!(
             app.viewer.loaded.as_ref().unwrap().display_name(),
             "plain.txt"
         );
+    }
+
+    thread_local! {
+        static LAUNCHED: std::cell::RefCell<Vec<(Launch, PathBuf)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn stub_launcher(program: Launch, path: &Path) -> Result<(), String> {
+        LAUNCHED.with(|log| log.borrow_mut().push((program, path.to_path_buf())));
+        Ok(())
+    }
+    fn launched() -> Vec<(Launch, PathBuf)> {
+        LAUNCHED.with(|log| log.borrow().clone())
+    }
+    fn failing_launcher(_: Launch, _: &Path) -> Result<(), String> {
+        Err("cannot run code: not found".to_string())
+    }
+
+    fn menu_app(dir: &tempfile::TempDir, select: &str) -> App {
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs").join("guide.md"), b"# Guide\n").unwrap();
+        let mut app = app(dir);
+        app.explorer.refresh();
+        app.launcher = stub_launcher;
+        LAUNCHED.with(|log| log.borrow_mut().clear());
+        assert!(app.explorer.select_visible_path(&dir.path().join(select)));
+        app
+    }
+
+    #[test]
+    fn enter_in_the_explorer_opens_the_actions_for_the_entry() {
+        let dir = project();
+        let mut app = menu_app(&dir, "plain.txt");
+        press(&mut app, KeyCode::Enter);
+        let menu = app.file_menu.clone().expect("menu");
+        assert!(!menu.is_dir);
+        assert_eq!(
+            menu.actions,
+            [
+                FileAction::Open,
+                FileAction::VsCode,
+                FileAction::Terminal,
+                FileAction::DefaultApp,
+                FileAction::Edit,
+                FileAction::CopyPath,
+                FileAction::CopyName,
+            ]
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.file_menu.is_none());
+        assert_eq!(app.focus, Focus::Explorer, "Esc only closes the menu");
+
+        // A folder has no Edit entry.
+        assert!(app.explorer.select_visible_path(&dir.path().join("docs")));
+        press(&mut app, KeyCode::Enter);
+        let menu = app.file_menu.clone().unwrap();
+        assert!(menu.is_dir);
+        assert!(!menu.actions.contains(&FileAction::Edit));
+    }
+
+    #[test]
+    fn space_still_opens_files_straight_away() {
+        let dir = project();
+        let mut app = menu_app(&dir, "plain.txt");
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.viewer.loaded.as_ref().unwrap().display_name(), "plain.txt");
+    }
+
+    #[test]
+    fn the_menu_opens_vs_code_and_a_terminal_in_the_right_place() {
+        let dir = project();
+        let mut app = menu_app(&dir, "plain.txt");
+        let file = dir.path().join("plain.txt");
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down); // Open in VS Code
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(launched(), vec![(Launch::VsCode, file.clone())]);
+        assert!(app.status.as_ref().unwrap().text.contains("VS Code"));
+        assert_eq!(app.overlay, Overlay::None);
+
+        // A terminal for a file starts in its folder (picked with its number).
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('3'));
+        assert_eq!(launched()[1], (Launch::Terminal, dir.path().to_path_buf()));
+
+        // ...and for a folder, in the folder itself.
+        assert!(app.explorer.select_visible_path(&dir.path().join("docs")));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('3'));
+        assert_eq!(launched()[2], (Launch::Terminal, dir.path().join("docs")));
+    }
+
+    #[test]
+    fn a_failing_program_is_reported_in_the_status_bar() {
+        let dir = project();
+        let mut app = menu_app(&dir, "plain.txt");
+        app.launcher = failing_launcher;
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('2'));
+        let status = app.status.as_ref().unwrap().text.clone();
+        assert!(status.contains("failed") && status.contains("not found"), "{status}");
+    }
+
+    #[test]
+    fn the_menu_copies_the_path_and_the_name() {
+        let dir = project();
+        let mut app = menu_app(&dir, "plain.txt");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('6'));
+        assert_eq!(
+            app.take_clipboard().unwrap(),
+            dir.path().join("plain.txt").display().to_string()
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('7'));
+        assert_eq!(app.take_clipboard().unwrap(), "plain.txt");
+    }
+
+    #[test]
+    fn clicking_an_action_runs_it() {
+        let dir = project();
+        let mut app = menu_app(&dir, "plain.txt");
+        press(&mut app, KeyCode::Enter);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let rect = app
+            .hits
+            .borrow()
+            .iter()
+            .find(|(_, hit)| *hit == Hit::FileAction(1))
+            .map(|(rect, _)| *rect)
+            .expect("row recorded");
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), rect.x + 3, rect.y));
+        assert_eq!(launched(), vec![(Launch::VsCode, dir.path().join("plain.txt"))]);
     }
 
     #[test]
@@ -3445,8 +3831,9 @@ mod tests {
         let mut app = App::with_config(Some(dir.path()), config);
         app.set_terminal_area(Rect::new(0, 0, 100, 30));
 
-        press(&mut app, KeyCode::Char('q'));
-        assert!(!app.should_quit, "q is no longer bound");
+        // Quitting cannot be rebound: `x` does nothing, only `q` quits.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.should_quit, "quit is not configurable");
         press(&mut app, KeyCode::F(4));
         assert!(!app.show_term);
         press_ctrl(&mut app, 'a');
@@ -3455,7 +3842,7 @@ mod tests {
         // The old prefix no longer starts a sequence.
         press_ctrl(&mut app, 'r');
         assert!(app.pending.is_none());
-        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('q'));
         assert!(app.should_quit);
     }
 
@@ -3531,13 +3918,12 @@ mod tests {
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL),
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         ] {
             app.handle_key(key);
             assert!(app.capturing_prefix, "{key:?} must not end the capture");
             assert_eq!(app.config.prefix, "ctrl+r");
         }
-        assert!(!app.should_quit, "q and Ctrl+C did not reach the shortcuts");
+        assert!(!app.should_quit, "q did not reach the shortcuts");
         assert!(app.status.as_ref().unwrap().text.contains("already used"));
         // A valid key still works afterwards.
         app.handle_key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE));

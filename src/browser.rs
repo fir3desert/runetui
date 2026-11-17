@@ -24,7 +24,7 @@ pub fn is_openable(url: &str) -> bool {
 }
 
 /// The program and fixed arguments that open an address on this system.
-fn opener() -> (&'static str, &'static [&'static str]) {
+pub(crate) fn opener() -> (&'static str, &'static [&'static str]) {
     if cfg!(target_os = "macos") {
         ("open", &[])
     } else if cfg!(windows) {

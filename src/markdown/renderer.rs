@@ -10,7 +10,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::code_highlighter::CodeHighlighter;
 use super::parser::{Block, Inline, LinkKind, ListBlock, TableAlign, TableBlock, inline_plain};
-use super::{DocLink, Heading, RLine, RSpan, RenderedDoc, slugify};
+use super::{CodeRegion, DocLink, Heading, RLine, RSpan, RenderedDoc, slugify};
 use crate::ui::themes::Theme;
 
 /// Render a Markdown document.
@@ -397,6 +397,7 @@ impl Renderer<'_> {
 
     fn code_block(&mut self, lang: &str, code: &str, ctx: Ctx) {
         self.ensure_blank();
+        let region_start = self.out.lines.len();
         let highlighted = self.highlighter.highlight(code, lang, &self.theme);
         let width = ctx.content_width(self.width);
 
@@ -414,6 +415,15 @@ impl Renderer<'_> {
                 ctx,
                 width,
             );
+        }
+
+        let region_end = self.out.lines.len();
+        if region_end > region_start {
+            self.out.code_blocks.push(CodeRegion {
+                start: region_start,
+                end: region_end,
+                code: code.trim_end_matches('\n').to_string(),
+            });
         }
 
         if !ctx.compact {

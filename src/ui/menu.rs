@@ -236,11 +236,16 @@ fn rgb_of(color: Color) -> Rgb {
 /// foreground and background colours are blended towards black, so the
 /// interface behind stays readable but clearly recedes.  (`Modifier::DIM` is
 /// not used: many terminals ignore it.)
-fn dim_background(frame: &mut Frame, area: Rect, theme: &Theme) {
+fn dim_background(frame: &mut Frame, area: Rect, theme: &Theme, keep: Option<Rect>) {
     let (fallback_fg, fallback_bg) = (rgb_of(theme.fg), rgb_of(theme.bg));
+    let keep = keep;
     let buffer = frame.buffer_mut();
     for y in area.y..area.bottom() {
         for x in area.x..area.right() {
+            // The header's right corner (kind, progress, stars) stays as it is.
+            if keep.is_some_and(|rect| rect.contains((x, y).into())) {
+                continue;
+            }
             if let Some(cell) = buffer.cell_mut((x, y)) {
                 let (fg, bg) = (cell.fg, cell.bg);
                 cell.set_fg(darken(fg, fallback_fg));
@@ -305,7 +310,7 @@ pub fn render_menu(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
         return;
     }
     let theme = app.theme();
-    dim_background(frame, area, &theme);
+    dim_background(frame, area, &theme, app.header_keep.get());
 
     let banner_w = banner_width();
     let needed_height = 11 + 3 * 4;
@@ -314,36 +319,17 @@ pub fn render_menu(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
     } else {
         render_compact_menu(frame, area, app, &theme, selected);
     }
-    draw_corners(frame, area, app, &theme);
+    draw_corners(frame, area, &theme);
 }
 
 /// Colour of the star count.
 pub const STAR_COLOR: Color = Color::Rgb(0xf5, 0xc2, 0x4b);
 
-/// Star count of the repository at the top right and the credit at the
-/// bottom right of the screen.
-fn draw_corners(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+/// The credit at the bottom right of the screen.  The star count stays in the
+/// header, which the menu does not dim.
+fn draw_corners(frame: &mut Frame, area: Rect, theme: &Theme) {
     if area.width < 12 || area.height < 3 {
         return;
-    }
-    if let Some(text) = crate::stars::label(app.stars.state()) {
-        let width = UnicodeWidthStr::width(text.as_str()) as u16;
-        if width + 3 <= area.width {
-            app.star_rect.set(Some(Rect::new(
-                area.right() - width - 1,
-                area.y,
-                width,
-                1,
-            )));
-            // A leading blank keeps it apart from the header text.
-            put_corner(
-                frame,
-                area.right() - width - 2,
-                area.y,
-                &format!(" {text}"),
-                Style::default().fg(STAR_COLOR).add_modifier(Modifier::BOLD),
-            );
-        }
     }
     // The key hint is centred on the same row; leave it alone when they meet.
     let credit = CREDIT;
@@ -636,8 +622,8 @@ fn option_text(app: &App, item: OptionItem) -> OptionText {
                     value: format!("prefix {}", app.keymap.prefix_label()),
                     description: format!(
                         "Enter, then press a key to make it the prefix (saved in config.toml). \
-                         The other shortcuts are the [keys] table of {place} (e.g. quit = \
-                         [\"q\", \"ctrl+c\"]); two-key shortcuts are written \"prefix left\"."
+                         The other shortcuts are the [keys] table of {place} (e.g. toggle_terminal = \
+                         \"ctrl+t\"; quit is always just `q`); two-key shortcuts are written \"prefix left\"."
                     ),
                 }
             }
@@ -653,7 +639,7 @@ fn option_text(app: &App, item: OptionItem) -> OptionText {
             label: "GitHub stars",
             value: on_off(app.config.show_stars),
             description: format!(
-                "Show the star count of github.com/{} in the corner of the Esc menu. It is \
+                "Show the star count of github.com/{} at the top right of the header. It is \
                  fetched once an hour in the background with curl and is the only network \
                  request runetui makes; OFF keeps it fully offline.",
                 crate::stars::REPO
@@ -730,7 +716,7 @@ pub fn render_options(frame: &mut Frame, area: Rect, app: &App, tab: usize, sele
         return;
     }
     let theme = app.theme();
-    dim_background(frame, area, &theme);
+    dim_background(frame, area, &theme, app.header_keep.get());
 
     let width = area.width.saturating_sub(4).min(84);
     let height = area.height.saturating_sub(2).min(16);
@@ -882,7 +868,7 @@ pub fn render_themes(frame: &mut Frame, area: Rect, app: &App, selected: usize) 
         return;
     }
     let theme = app.theme();
-    dim_background(frame, area, &theme);
+    dim_background(frame, area, &theme, app.header_keep.get());
 
     let count = ThemeName::ALL.len() as u16;
     let banner_w = banner_width();

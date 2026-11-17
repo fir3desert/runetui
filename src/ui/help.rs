@@ -60,7 +60,8 @@ pub fn sections(keymap: &Keymap) -> Vec<HelpSection> {
             title: "Explorer",
             entries: vec![
                 fixed("↑ / ↓", "Move selection (files preview automatically)"),
-                fixed("Space / Enter", "Open a file, or expand/collapse a folder"),
+                fixed("Space", "Open a file, or expand/collapse a folder"),
+                fixed("Enter", "Actions: open, VS Code, terminal, default app, edit, copy path"),
                 fixed("Home / End", "Jump to the first / last entry"),
                 fixed("PageUp / PageDown", "Move a page up / down"),
                 entry(keymap, Action::Edit, "Edit the selected file inside runetui (vim)"),

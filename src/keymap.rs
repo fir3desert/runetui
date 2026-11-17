@@ -11,7 +11,6 @@
 //! prefix = "ctrl+r"
 //!
 //! [keys]
-//! quit = ["q", "ctrl+c"]
 //! toggle_terminal = "ctrl+t"
 //! explorer_shrink = ["prefix left", "ctrl+left"]
 //! ```
@@ -71,7 +70,7 @@ const META: &[Meta] = &[
         name: "quit",
         short: "quit",
         description: "Quit runetui",
-        defaults: &["q", "ctrl+c", "prefix q"],
+        defaults: &["q"],
     },
     Meta {
         action: Action::Menu,
@@ -98,7 +97,7 @@ const META: &[Meta] = &[
         action: Action::FollowLink,
         name: "follow_link",
         short: "follow link",
-        description: "Follow the link on the current line (Space also opens files in the explorer)",
+        description: "Follow the link on the current line, or copy the code block under the cursor (Space also opens files in the explorer)",
         defaults: &["space"],
     },
     Meta {
@@ -670,6 +669,11 @@ impl Keymap {
                     }
                 });
             let chords = match parsed {
+                // Quitting is only ever the plain `q` key: neither Ctrl+C nor
+                // a sequence (nor an old `config.toml` saying so) can quit.
+                _ if action == Action::Quit => {
+                    parse_list(&["q".to_string()], prefix_chord).expect("q parses")
+                }
                 Some(Ok(list)) => list,
                 _ => {
                     let defaults: Vec<String> =
@@ -984,9 +988,22 @@ mod tests {
     }
 
     #[test]
+    fn only_the_plain_q_key_quits_whatever_the_config_says() {
+        let mut specs = BTreeMap::new();
+        specs.insert(
+            "quit".to_string(),
+            KeySpec::Many(vec!["x".into(), "ctrl+c".into(), "prefix q".into()]),
+        );
+        let map = Keymap::from_config("ctrl+r", &specs);
+        let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(map.resolve(None, &plain('q'), false), Resolution::Action(Action::Quit));
+        assert_eq!(map.resolve(None, &ctrl_c, false), Resolution::Pass, "Ctrl+C does nothing");
+        assert_eq!(map.resolve(None, &plain('x'), false), Resolution::Pass);
+    }
+
+    #[test]
     fn config_overrides_defaults_and_bad_entries_fall_back() {
         let mut specs = BTreeMap::new();
-        specs.insert("quit".to_string(), KeySpec::One("x".into()));
         specs.insert(
             "toggle_terminal".to_string(),
             KeySpec::Many(vec!["f4".into(), "prefix `".into()]),
@@ -995,8 +1012,7 @@ mod tests {
         specs.insert("nonsense".to_string(), KeySpec::One("z".into()));
         let map = Keymap::from_config("ctrl+a", &specs);
 
-        assert_eq!(map.resolve(None, &plain('x'), false), Resolution::Action(Action::Quit));
-        assert_eq!(map.resolve(None, &plain('q'), false), Resolution::Pass, "old binding is gone");
+        assert_eq!(map.resolve(None, &plain('q'), false), Resolution::Action(Action::Quit));
         assert_eq!(
             map.resolve(None, &key(KeyCode::F(4), KeyModifiers::NONE), false),
             Resolution::Action(Action::ToggleTerminal)
@@ -1085,8 +1101,7 @@ mod tests {
         assert!(ok("ctrl+h").unwrap_err().contains("Backspace"));
         assert!(ok("ctrl+j").unwrap_err().contains("Enter"));
         assert!(ok("ctrl+[").unwrap_err().contains("Esc"));
-        // Ctrl+T toggles the terminal and Ctrl+C quits by default.
+        // Ctrl+T toggles the terminal; Ctrl+C does nothing (only `q` quits).
         assert!(ok("ctrl+t").unwrap_err().contains("already used"));
-        assert!(ok("ctrl+c").unwrap_err().contains("already used"));
     }
 }
