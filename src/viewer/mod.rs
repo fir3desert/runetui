@@ -17,7 +17,7 @@ use crate::markdown::code_highlighter::{
     CodeHighlighter, HighlightSession, canonical_label, sniff_language,
 };
 use crate::markdown::parser::Block;
-use crate::markdown::{Heading, RSpan, RenderedDoc, parse, renderer, toc};
+use crate::markdown::{Heading, LineSpan, RSpan, RenderedDoc, SourceRange, parse_spanned, renderer, toc};
 use crate::ui::themes::{Theme, ThemeName};
 
 /// Preview limit.  Larger files are reported as unsupported instead of
@@ -77,10 +77,19 @@ impl DocKind {
 
 #[derive(Debug, Clone)]
 pub enum ParsedContent {
-    Markdown(Vec<Block>),
+    Markdown(MarkdownDoc),
     Plain(Vec<String>),
     Code { lang: String, lines: Vec<String> },
     Message { title: String, detail: String },
+}
+
+/// A parsed Markdown file: its blocks, the source lines each came from and the
+/// source text itself (for copying and exporting the original Markdown).
+#[derive(Debug, Clone)]
+pub struct MarkdownDoc {
+    pub blocks: Vec<Block>,
+    pub spans: Vec<LineSpan>,
+    pub source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -211,7 +220,14 @@ pub fn load_document(path: &Path) -> Result<LoadedDoc> {
         "md" | "markdown" | "mdown" | "mkd" | "mkdn" => Ok(LoadedDoc {
             path: path.to_path_buf(),
             kind: DocKind::Markdown,
-            content: ParsedContent::Markdown(parse(&source)),
+            content: {
+                let parsed = parse_spanned(&source);
+                ParsedContent::Markdown(MarkdownDoc {
+                    blocks: parsed.blocks,
+                    spans: parsed.spans,
+                    source,
+                })
+            },
             bytes,
         }),
         "txt" | "text" | "log" | "rst" | "adoc" | "org" => Ok(LoadedDoc {
@@ -338,9 +354,17 @@ fn render_document(
     previous: Option<LazyCode>,
 ) -> (RenderedDoc, Option<LazyCode>) {
     match &loaded.content {
-        ParsedContent::Markdown(blocks) => {
-            (renderer::render(blocks, width, theme, highlighter), None)
-        }
+        ParsedContent::Markdown(markdown) => (
+            renderer::render_with_source(
+                &markdown.blocks,
+                &markdown.spans,
+                &markdown.source,
+                width,
+                theme,
+                highlighter,
+            ),
+            None,
+        ),
         ParsedContent::Plain(lines) => (text::render_plain(lines, width, theme), None),
         ParsedContent::Code { lang, lines, .. } if lines.len() >= LAZY_MIN_LINES => {
             let total = lines.len();
@@ -548,10 +572,17 @@ impl Viewer {
              Markdown links, `[[wikilinks]]` and anchors can be opened with `Enter` when the cursor \
              is on their line.\n"
         );
-        let blocks = parse(&source);
+        let parsed = parse_spanned(&source);
         self.loaded = None;
         self.lazy = None;
-        self.doc = renderer::render(&blocks, width, theme, highlighter);
+        self.doc = renderer::render_with_source(
+            &parsed.blocks,
+            &parsed.spans,
+            &source,
+            width,
+            theme,
+            highlighter,
+        );
         self.title = "Welcome".to_string();
         self.kind_label = "welcome".to_string();
         self.cursor = 0;
@@ -577,8 +608,15 @@ impl Viewer {
             self.doc = doc;
             self.lazy = lazy;
         } else if let Some(source) = &self.welcome_source {
-            let blocks = parse(source);
-            self.doc = renderer::render(&blocks, width, theme, highlighter);
+            let parsed = parse_spanned(source);
+            self.doc = renderer::render_with_source(
+                &parsed.blocks,
+                &parsed.spans,
+                source,
+                width,
+                theme,
+                highlighter,
+            );
         } else {
             return;
         }
@@ -850,6 +888,93 @@ impl Viewer {
     }
 }
 
+// ------------------------------------------------------------- source lines
+
+impl Viewer {
+    /// Source line (0-based) shown at rendered row `row` of the open file.  For
+    /// a Markdown block that cannot be followed row by row this is the line
+    /// the block starts on.  `None` for messages and the welcome screen.
+    pub fn source_line_at(&self, row: usize) -> Option<usize> {
+        match &self.loaded.as_ref()?.content {
+            ParsedContent::Code { .. } => syntax::source_line_of_row(&self.doc, row),
+            ParsedContent::Markdown(_) | ParsedContent::Plain(_) => self.doc.source_line_at(row),
+            ParsedContent::Message { .. } => None,
+        }
+    }
+
+    /// First rendered row that shows source line `line` (0-based).  A long
+    /// source file may need [`Viewer::load_all`] before its far end is found.
+    pub fn row_of_source_line(&self, line: usize) -> Option<usize> {
+        match &self.loaded.as_ref()?.content {
+            ParsedContent::Code { .. } => syntax::row_of_source_line(&self.doc, line),
+            ParsedContent::Markdown(_) | ParsedContent::Plain(_) => {
+                self.doc.row_of_source_line(line)
+            }
+            ParsedContent::Message { .. } => None,
+        }
+    }
+
+    /// Row of the open Markdown file where `label` is drawn inside the block
+    /// that holds source line `line`.
+    pub fn row_of_text_near_line(&self, line: usize, label: &str) -> Option<usize> {
+        match &self.loaded.as_ref()?.content {
+            ParsedContent::Markdown(_) => self.doc.row_of_text_in_block(line, label),
+            _ => None,
+        }
+    }
+
+    /// Text of source line `line` (0-based) of the open file.
+    pub fn source_line_text(&self, line: usize) -> Option<String> {
+        match &self.loaded.as_ref()?.content {
+            ParsedContent::Markdown(markdown) => markdown.source.lines().nth(line).map(str::to_string),
+            ParsedContent::Plain(lines) | ParsedContent::Code { lines, .. } => lines.get(line).cloned(),
+            ParsedContent::Message { .. } => None,
+        }
+    }
+
+    /// Source lines behind the rendered rows `first..=last` of the open file.
+    /// For a source-code view each row maps to the line numbered in its gutter;
+    /// a row that only continues a wrapped line makes the range inexact.
+    pub fn source_range_of_rows(&self, first: usize, last: usize) -> Option<SourceRange> {
+        let (first, last) = if first <= last { (first, last) } else { (last, first) };
+        match &self.loaded.as_ref()?.content {
+            ParsedContent::Markdown(_) | ParsedContent::Plain(_) => self.doc.source_range(first, last),
+            ParsedContent::Code { .. } => {
+                let start = syntax::source_line_of_row(&self.doc, first)?;
+                let end = syntax::source_line_of_row(&self.doc, last)?.max(start);
+                let starts_a_line = |row: usize, line: usize| syntax::row_of_source_line(&self.doc, line) == Some(row);
+                Some(SourceRange {
+                    start,
+                    end,
+                    exact: starts_a_line(first, start) && starts_a_line(last, end),
+                })
+            }
+            ParsedContent::Message { .. } => None,
+        }
+    }
+
+    /// Is the open file a Markdown document?
+    pub fn markdown_file(&self) -> bool {
+        matches!(self.loaded.as_ref().map(|loaded| &loaded.content), Some(ParsedContent::Markdown(_)))
+    }
+
+    /// Source lines `start..=end` (0-based) of the open file, as they are in
+    /// the file, joined with newlines.
+    pub fn source_lines(&self, start: usize, end: usize) -> Option<String> {
+        match &self.loaded.as_ref()?.content {
+            ParsedContent::Markdown(markdown) => {
+                let lines: Vec<&str> = markdown.source.lines().skip(start).take(end + 1 - start).collect();
+                (!lines.is_empty()).then(|| lines.join("\n"))
+            }
+            ParsedContent::Plain(lines) | ParsedContent::Code { lines, .. } => {
+                let slice = lines.get(start..(end + 1).min(lines.len()))?;
+                (!slice.is_empty()).then(|| slice.join("\n"))
+            }
+            ParsedContent::Message { .. } => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,7 +1004,7 @@ mod tests {
     }
     impl ContentHeading for LoadedDoc {
         fn content_has_heading(&self) -> bool {
-            matches!(&self.content, ParsedContent::Markdown(blocks) if !blocks.is_empty())
+            matches!(&self.content, ParsedContent::Markdown(markdown) if !markdown.blocks.is_empty())
         }
     }
 

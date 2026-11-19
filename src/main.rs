@@ -6,17 +6,21 @@
 //! under the platform configuration directory.
 
 mod app;
+mod backlinks;
 mod browser;
 mod clipboard;
 mod config;
 mod editor;
 mod events;
+mod export;
 mod filesystem;
+mod finder;
 mod keymap;
 mod launcher;
 mod markdown;
 mod selection;
 mod stars;
+mod state;
 mod trace;
 mod ui;
 mod viewer;
@@ -40,7 +44,7 @@ use crate::ui::themes::ThemeName;
     name = "rtui",
     version,
     about = "Markdown and source-code viewer for the terminal",
-    after_help = "Keys: ↑/↓ move · Space/Enter open · ←/→ tree · Tab switch panel · e edit here (vim) · Ctrl+T terminal · Ctrl+R then ←→↑↓ resize panels · Esc menu · / search · o outline · T theme · F icons · ? help · q quit (all shortcuts: [keys] in config.toml)"
+    after_help = "Keys: ↑/↓ move · Space/Enter open · ←/→ tree · Tab switch panel · Ctrl+P find file · e edit here (vim) · Ctrl+T terminal · Ctrl+R then ←→↑↓ resize panels · Esc menu · / search · o outline · T theme · F icons · ? help · q quit (all shortcuts: [keys] in config.toml)"
 )]
 struct Cli {
     /// Directory or document to open

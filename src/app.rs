@@ -21,6 +21,10 @@ use ratatui::layout::Rect;
 
 use crate::config::{self, Config};
 use crate::editor::{EmbeddedEditor, PtyPane};
+use crate::backlinks::BacklinkIndex;
+use crate::export::{self, Format};
+use crate::finder::Finder;
+use crate::state::{self, ProjectState, Toggle};
 use crate::filesystem::Explorer;
 use crate::filesystem::watcher::{FileWatcher, WatcherState};
 use crate::keymap::{Action, Chord, DEFAULT_PREFIX, Keymap, Resolution};
@@ -49,6 +53,10 @@ const WIKI_SCAN_LIMIT: usize = 25_000;
 const PREFIX_TIMEOUT: Duration = Duration::from_secs(3);
 /// Lines moved by one mouse-wheel notch.
 const WHEEL_LINES: isize = 3;
+/// Rows moved by PageUp / PageDown in the file finder.
+const FINDER_PAGE: usize = 10;
+/// The link index starts this long after launch, once the first frames are out.
+const BACKLINKS_START_DELAY: Duration = Duration::from_millis(300);
 /// Step of the explorer width (percent) and the terminal height (percent).
 pub const EXPLORER_STEP: i16 = 2;
 pub const TERMINAL_STEP: i16 = 5;
@@ -70,6 +78,22 @@ impl Focus {
     }
 }
 
+/// The two lists of the bookmarks popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListTab {
+    Bookmarks,
+    Recent,
+}
+
+impl ListTab {
+    pub fn other(self) -> Self {
+        match self {
+            ListTab::Bookmarks => ListTab::Recent,
+            ListTab::Recent => ListTab::Bookmarks,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     None,
@@ -77,6 +101,20 @@ pub enum Overlay {
         scroll: usize,
     },
     Outline {
+        selected: usize,
+    },
+    /// Fuzzy file finder (`Ctrl+P`).  The query and the ranked results live in
+    /// `App::finder`; `selected` indexes into those results.
+    Finder {
+        selected: usize,
+    },
+    /// Files that link to the open file (`B`).
+    Backlinks {
+        selected: usize,
+    },
+    /// Bookmarks and recently opened files (`'`), two lists in one popup.
+    Bookmarks {
+        tab: ListTab,
         selected: usize,
     },
     /// Chooser for a line that holds several links (see `App::link_choices`).
@@ -123,6 +161,14 @@ pub enum Hit {
     Outline(usize),
     /// Row of the links chooser.
     Link(usize),
+    /// Result row of the file finder.
+    Finder(usize),
+    /// Row of the backlinks popup.
+    Backlink(usize),
+    /// Tab of the bookmarks popup.
+    BookmarkTab(ListTab),
+    /// Row of the list shown by the bookmarks popup.
+    BookmarkRow(usize),
     /// Row of the file actions menu.
     FileAction(usize),
     /// The frame of a popup: a click outside every panel dismisses it.
@@ -140,6 +186,10 @@ pub enum FileAction {
     Edit,
     CopyPath,
     CopyName,
+    /// Opens the Export submenu.
+    Export,
+    ExportHtml,
+    ExportPdf,
 }
 
 impl FileAction {
@@ -153,6 +203,9 @@ impl FileAction {
             FileAction::Edit => "Edit here",
             FileAction::CopyPath => "Copy path",
             FileAction::CopyName => "Copy name",
+            FileAction::Export => "Export...",
+            FileAction::ExportHtml => "HTML (self-contained page)",
+            FileAction::ExportPdf => "PDF",
         }
     }
 }
@@ -164,6 +217,10 @@ pub struct FileMenu {
     pub name: String,
     pub is_dir: bool,
     pub actions: Vec<FileAction>,
+    /// Showing the Export choices (Esc goes back to the actions).
+    pub submenu: bool,
+    /// Drawn under the explorer row (false: centred, for the shortcut).
+    pub anchored: bool,
 }
 
 /// Programs the file actions menu starts.
@@ -306,10 +363,23 @@ pub struct App {
     pub adjusting: bool,
     /// Text selection confined to one pane.
     pub selection: Option<Selection>,
+    /// The selection the last key press ended (read by copy-as-Markdown).
+    ended_selection: Option<Selection>,
     /// Options → Key bindings: the next key press becomes the prefix.
     pub capturing_prefix: bool,
     /// GitHub star count shown in the Esc menu.
     pub stars: Stars,
+    /// Project file index and results of the `Ctrl+P` finder.
+    pub finder: Finder,
+    /// Result of the export running on a background thread.
+    export_job: Option<std::sync::mpsc::Receiver<export::Outcome>>,
+    /// `PATH` to search for PDF converters instead of the real one (tests).
+    export_path_var: Option<std::ffi::OsString>,
+    /// Which files link to which, built in the background.
+    pub backlinks: BacklinkIndex,
+    /// Bookmarks and recent files of this project (saved in `state.toml`).
+    pub project_state: ProjectState,
+    state_path: Option<PathBuf>,
 
     selection_copied: bool,
     clipboard: Option<String>,
@@ -396,8 +466,15 @@ impl App {
             pending: None,
             adjusting: false,
             selection: None,
+            ended_selection: None,
             capturing_prefix: false,
             stars: trace::span("stars start", || Stars::start(config.show_stars)),
+            finder: Finder::new(),
+            export_job: None,
+            export_path_var: None,
+            backlinks: BacklinkIndex::new(),
+            project_state: ProjectState::default(),
+            state_path: state::default_path(),
             selection_copied: false,
             clipboard: None,
             term_failed: false,
@@ -428,6 +505,7 @@ impl App {
         config.last_directory = Some(root.clone());
         app.config = config;
 
+        let cli_opened_file = initial_file.is_some();
         trace::span("initial document", || {
             if let Some(file) = initial_file {
                 app.open_file(file, None, true);
@@ -440,6 +518,17 @@ impl App {
                 }
             }
         });
+        // Bookmarks and recent files come after the first document, so the
+        // README opened by default is not counted as something the user opened.
+        app.project_state = match &app.state_path {
+            Some(path) => state::load(path, &app.root),
+            None => ProjectState::default(),
+        };
+        if let Some(file) = app.viewer.loaded.as_ref().map(|loaded| loaded.path.clone()) {
+            if cli_opened_file {
+                app.note_recent(&file);
+            }
+        }
         // Start in the explorer so the project can be browsed immediately.
         app.focus = if app.layout.explorer.is_some() {
             Focus::Explorer
@@ -573,8 +662,10 @@ impl App {
     }
 
     fn open_file(&mut self, path: PathBuf, anchor: Option<String>, record_history: bool) {
+        let opened = path.clone();
         if self.load_into_viewer(path, anchor, record_history) {
             self.focus = Focus::Viewer;
+            self.note_recent(&opened);
         }
     }
 
@@ -607,6 +698,8 @@ impl App {
 
     /// Reload the current document from disk, preserving the cursor position.
     pub fn reload_current(&mut self) {
+        // The links of the open file may have changed.
+        self.backlinks.invalidate();
         let Some(loaded) = self.viewer.loaded.clone() else {
             self.show_welcome();
             return;
@@ -686,6 +779,9 @@ impl App {
             self.pending = None;
         }
         self.explorer.poll();
+        self.poll_finder();
+        self.poll_backlinks();
+        self.poll_export();
         self.sync_watcher();
         self.poll_watcher_state();
         if let Some(watcher) = &self.watcher {
@@ -710,6 +806,9 @@ impl App {
             let dirs: Vec<PathBuf> = std::mem::take(&mut self.dirty_dirs).into_iter().collect();
             if !dirs.is_empty() {
                 self.explorer.refresh_dirs(&dirs);
+                // Files came or went: the finder's index is out of date.
+                self.finder.invalidate();
+                self.backlinks.invalidate();
             }
             if std::mem::take(&mut self.reload_pending) {
                 self.reload_current();
@@ -787,7 +886,11 @@ impl App {
             .as_ref()
             .is_some_and(|watcher| watcher.state() == WatcherState::Starting)
             && self.watch_key.is_some();
-        let listing = self.explorer.busy_since();
+        let listing = match (self.explorer.busy_since(), self.finder.scan_started()) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        };
         match (watcher_starting.then_some(self.started_at), listing) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (Some(only), None) | (None, Some(only)) => Some(only),
@@ -800,6 +903,21 @@ impl App {
     pub fn indexing(&self) -> bool {
         self.work_started()
             .is_some_and(|since| since.elapsed() >= INDEXING_GRACE)
+    }
+
+    /// Spinner frame for the link index (it has its own clock, as it is not
+    /// part of the "indexing…" status the other background work shows).
+    pub fn backlink_spinner(&self) -> &'static str {
+        let step = self
+            .backlinks
+            .scan_started()
+            .map(|since| since.elapsed().as_millis() / 80)
+            .unwrap_or(0) as usize;
+        if self.config.icon_style() == crate::ui::icons::IconStyle::Ascii {
+            SPINNER_ASCII[step % SPINNER_ASCII.len()]
+        } else {
+            SPINNER_UNICODE[step % SPINNER_UNICODE.len()]
+        }
     }
 
     /// Current frame of the indexing spinner.
@@ -874,6 +992,382 @@ impl App {
         self.adjusting = false;
         self.capturing_prefix = false;
         self.overlay = self.overlay_stack.pop().unwrap_or(Overlay::None);
+    }
+
+    // -------------------------------------------------------------- backlinks
+
+    /// Project-relative path of the open file.
+    fn open_relative_path(&self) -> Option<String> {
+        let path = self.viewer.loaded.as_ref()?.path.clone();
+        self.relative_path(&path)
+    }
+
+    /// How many places link to the open file; `None` until the first index is
+    /// built or when no file inside the project is open.
+    pub fn backlink_count(&self) -> Option<usize> {
+        self.backlinks.count(&self.open_relative_path()?)
+    }
+
+    /// Keep the link index going: it starts shortly after the first frames (so
+    /// opening a huge project stays instant) and follows changes on disk.
+    fn poll_backlinks(&mut self) {
+        self.backlinks.poll();
+        if self.started_at.elapsed() >= BACKLINKS_START_DELAY {
+            self.backlinks.ensure(
+                &self.root,
+                self.explorer.show_hidden(),
+                self.explorer.respect_gitignore(),
+            );
+        }
+    }
+
+    fn open_backlinks(&mut self) {
+        if self.open_relative_path().is_none() {
+            self.set_status(if self.viewer.loaded.is_some() {
+                "Only files inside the project have backlinks"
+            } else {
+                "No file open"
+            });
+            return;
+        }
+        // Asked for: do not wait for the start-up delay.
+        self.backlinks.ensure(
+            &self.root,
+            self.explorer.show_hidden(),
+            self.explorer.respect_gitignore(),
+        );
+        self.overlay = Overlay::Backlinks { selected: 0 };
+    }
+
+    /// The links to the open file, as listed by the popup.
+    pub fn current_backlinks(&self) -> &[crate::backlinks::Backlink] {
+        match self.open_relative_path() {
+            Some(relative) => self.backlinks.backlinks(&relative),
+            None => &[],
+        }
+    }
+
+    fn choose_backlink(&mut self, index: usize) {
+        let Some(link) = self.current_backlinks().get(index).cloned() else {
+            return;
+        };
+        self.close_overlay();
+        let path = self.root.join(&link.source);
+        if !path.is_file() {
+            self.backlinks.invalidate();
+            self.set_status(format!("No longer exists: {}", link.source));
+            return;
+        }
+        self.open_file(path, None, true);
+        self.jump_to_source_line(link.line);
+        // A link inside a wrapped paragraph or a list is mapped to its block:
+        // look for the link itself within the block.
+        if let Some(row) = self.viewer.row_of_text_near_line(link.line, &link.label) {
+            self.jump_viewer_to(row);
+        }
+        self.set_status(format!("{}:{}", link.source, link.line + 1));
+    }
+
+    fn handle_backlinks_key(&mut self, key: KeyEvent, selected: usize) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let last = self.current_backlinks().len().saturating_sub(1);
+        let mut selected = selected.min(last);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') if !ctrl => {
+                self.close_overlay();
+                return;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.choose_backlink(selected);
+                return;
+            }
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::PageDown => selected = (selected + FINDER_PAGE).min(last),
+            KeyCode::PageUp => selected = selected.saturating_sub(FINDER_PAGE),
+            KeyCode::Home => selected = 0,
+            KeyCode::End => selected = last,
+            _ => {}
+        }
+        self.overlay = Overlay::Backlinks { selected };
+    }
+
+    // ------------------------------------------------- bookmarks and recents
+
+    /// `path` relative to the project root, with `/` separators.
+    fn relative_path(&self, path: &Path) -> Option<String> {
+        let relative = path.strip_prefix(&self.root).ok().map(Path::to_path_buf).or_else(|| {
+            let (path, root) = (path.canonicalize().ok()?, self.root.canonicalize().ok()?);
+            path.strip_prefix(root).ok().map(Path::to_path_buf)
+        })?;
+        let text = relative.to_str()?.replace('\\', "/");
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn save_state(&mut self) {
+        let Some(path) = self.state_path.clone() else {
+            return;
+        };
+        if state::save(&path, &self.root, &self.project_state).is_err() {
+            self.set_status("Could not save the bookmarks and recent files");
+        }
+    }
+
+    /// A file was opened on purpose (not just previewed while browsing).
+    fn note_recent(&mut self, path: &Path) {
+        let Some(relative) = self.relative_path(path) else {
+            return;
+        };
+        if self.project_state.recent.first() == Some(&relative) {
+            return;
+        }
+        self.project_state.note_recent(&relative);
+        self.save_state();
+    }
+
+    /// Bookmark the current line of the open file, or remove its bookmark.
+    fn toggle_bookmark(&mut self) {
+        let Some(path) = self.viewer.loaded.as_ref().map(|loaded| loaded.path.clone()) else {
+            self.set_status("No file open to bookmark");
+            return;
+        };
+        let Some(relative) = self.relative_path(&path) else {
+            self.set_status("Only files inside the project can be bookmarked");
+            return;
+        };
+        let Some(line) = self.viewer.source_line_at(self.viewer.cursor) else {
+            self.set_status("Nothing to bookmark here");
+            return;
+        };
+        let text = (line..line + 4)
+            .filter_map(|candidate| self.viewer.source_line_text(candidate))
+            .find(|text| !text.trim().is_empty())
+            .unwrap_or_default();
+        let number = line + 1;
+        match self.project_state.toggle_bookmark(&relative, number, &text) {
+            Toggle::Added => self.set_status(format!("Bookmarked {relative}:{number}")),
+            Toggle::Removed => self.set_status(format!("Bookmark removed: {relative}:{number}")),
+            Toggle::Full => {
+                self.set_status(format!("Too many bookmarks (the limit is {})", state::MAX_BOOKMARKS));
+                return;
+            }
+        }
+        self.save_state();
+    }
+
+    fn open_bookmarks(&mut self) {
+        // Entries of files that were moved or deleted are dropped here.
+        let before = (self.project_state.bookmarks.len(), self.project_state.recent.len());
+        self.project_state.retain_existing(&self.root);
+        if before != (self.project_state.bookmarks.len(), self.project_state.recent.len()) {
+            self.save_state();
+        }
+        self.overlay = Overlay::Bookmarks {
+            tab: ListTab::Bookmarks,
+            selected: 0,
+        };
+    }
+
+    pub fn list_len(&self, tab: ListTab) -> usize {
+        match tab {
+            ListTab::Bookmarks => self.project_state.bookmarks.len(),
+            ListTab::Recent => self.project_state.recent.len(),
+        }
+    }
+
+    /// Move the viewer to a 0-based source line, loading more of a long source
+    /// file when the line is further down than what is rendered.
+    fn jump_to_source_line(&mut self, line: usize) {
+        let mut row = self.viewer.row_of_source_line(line);
+        if row.is_none() {
+            let theme = self.theme();
+            self.viewer.load_all(theme, &mut self.highlighter);
+            row = self.viewer.row_of_source_line(line);
+        }
+        if let Some(row) = row {
+            self.jump_viewer_to(row);
+        }
+    }
+
+    /// Open entry `index` of a list: a bookmark jumps to its line, a recent
+    /// file opens at its start.
+    fn choose_list_entry(&mut self, tab: ListTab, index: usize) {
+        let (file, line) = match tab {
+            ListTab::Bookmarks => match self.project_state.bookmarks.get(index) {
+                Some(bookmark) => (bookmark.file.clone(), Some(bookmark.line.saturating_sub(1))),
+                None => return,
+            },
+            ListTab::Recent => match self.project_state.recent.get(index) {
+                Some(file) => (file.clone(), None),
+                None => return,
+            },
+        };
+        self.close_overlay();
+        let path = self.root.join(&file);
+        if !path.is_file() {
+            match tab {
+                ListTab::Bookmarks => {
+                    self.project_state.remove_bookmark(index);
+                }
+                ListTab::Recent => {
+                    self.project_state.remove_recent(index);
+                }
+            }
+            self.save_state();
+            self.set_status(format!("No longer exists: {file}"));
+            return;
+        }
+        let same_file = self.viewer.loaded.as_ref().is_some_and(|loaded| loaded.path == path);
+        if same_file && line.is_some() {
+            self.push_history();
+            self.forward.clear();
+            self.focus = Focus::Viewer;
+        } else {
+            self.open_file(path, None, true);
+        }
+        if let Some(line) = line {
+            self.jump_to_source_line(line);
+            self.set_status(format!("{file}:{}", line + 1));
+        }
+    }
+
+    fn delete_list_entry(&mut self, tab: ListTab, index: usize) {
+        let removed = match tab {
+            ListTab::Bookmarks => self.project_state.remove_bookmark(index).is_some(),
+            ListTab::Recent => self.project_state.remove_recent(index).is_some(),
+        };
+        if removed {
+            self.save_state();
+        }
+    }
+
+    fn handle_bookmarks_key(&mut self, key: KeyEvent, tab: ListTab, selected: usize) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let count = self.list_len(tab);
+        let last = count.saturating_sub(1);
+        let mut tab = tab;
+        let mut selected = selected.min(last);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') if !ctrl => {
+                self.close_overlay();
+                return;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.choose_list_entry(tab, selected);
+                return;
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right
+            | KeyCode::Char('h') | KeyCode::Char('l')
+                if !ctrl =>
+            {
+                tab = tab.other();
+                selected = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::PageDown => selected = (selected + FINDER_PAGE).min(last),
+            KeyCode::PageUp => selected = selected.saturating_sub(FINDER_PAGE),
+            KeyCode::Home => selected = 0,
+            KeyCode::End => selected = last,
+            KeyCode::Char('d') | KeyCode::Delete if !ctrl => {
+                if count > 0 {
+                    self.delete_list_entry(tab, selected);
+                    selected = selected.min(self.list_len(tab).saturating_sub(1));
+                }
+            }
+            _ => {}
+        }
+        self.overlay = Overlay::Bookmarks { tab, selected };
+    }
+
+    // ---------------------------------------------------------------- finder
+
+    /// Open the fuzzy file finder with an empty query.  The project index is
+    /// built in the background the first time (and again after files change).
+    fn open_finder(&mut self) {
+        self.finder.query.clear();
+        self.finder.ensure(
+            &self.root,
+            self.explorer.show_hidden(),
+            self.explorer.respect_gitignore(),
+        );
+        self.finder.refresh();
+        self.overlay = Overlay::Finder { selected: 0 };
+    }
+
+    /// Take in indexed files, keep the index current while the finder is open
+    /// and keep its selection inside the results.
+    fn poll_finder(&mut self) {
+        self.finder.poll();
+        if let Overlay::Finder { selected } = self.overlay {
+            self.finder.ensure(
+                &self.root,
+                self.explorer.show_hidden(),
+                self.explorer.respect_gitignore(),
+            );
+            let last = self.finder.hits().len().saturating_sub(1);
+            if selected > last {
+                self.overlay = Overlay::Finder { selected: last };
+            }
+        }
+    }
+
+    /// Open result `index` in the viewer and reveal it in the explorer.
+    fn choose_finder_hit(&mut self, index: usize) {
+        let Some(hit) = self.finder.hits().get(index).cloned() else {
+            return;
+        };
+        let path = self.finder.absolute(&hit);
+        self.close_overlay();
+        if !path.is_file() {
+            self.finder.invalidate();
+            self.set_status(format!("No longer exists: {}", hit.path));
+            return;
+        }
+        self.open_file(path, None, true);
+    }
+
+    fn handle_finder_key(&mut self, key: KeyEvent, selected: usize) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let last = self.finder.hits().len().saturating_sub(1);
+        let mut selected = selected.min(last);
+        match (key.code, ctrl) {
+            (KeyCode::Esc, _) => {
+                self.close_overlay();
+                return;
+            }
+            (KeyCode::Enter, _) => {
+                self.choose_finder_hit(selected);
+                return;
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('n'), true) => selected = (selected + 1).min(last),
+            (KeyCode::Up, _) | (KeyCode::Char('p'), true) => selected = selected.saturating_sub(1),
+            (KeyCode::PageDown, _) => selected = (selected + FINDER_PAGE).min(last),
+            (KeyCode::PageUp, _) => selected = selected.saturating_sub(FINDER_PAGE),
+            (KeyCode::Home, _) => selected = 0,
+            (KeyCode::End, _) => selected = last,
+            (KeyCode::Backspace, _) => {
+                self.finder.backspace();
+                selected = 0;
+            }
+            (KeyCode::Char('u'), true) => {
+                self.finder.clear_query();
+                selected = 0;
+            }
+            (KeyCode::Char('w'), true) => {
+                self.finder.delete_word();
+                selected = 0;
+            }
+            // Every other character is text, `q` included: Esc leaves the
+            // finder, and `q` quits again once it is closed.
+            (KeyCode::Char(character), false) if !alt => {
+                self.finder.type_char(character);
+                selected = 0;
+            }
+            _ => {}
+        }
+        self.overlay = Overlay::Finder { selected };
     }
 
     fn open_theme_menu(&mut self) {
@@ -1131,11 +1625,16 @@ impl App {
         }
         actions.push(FileAction::CopyPath);
         actions.push(FileAction::CopyName);
+        if !is_dir {
+            actions.push(FileAction::Export);
+        }
         self.file_menu = Some(FileMenu {
             path: node.path.clone(),
             name: node.name.clone(),
             is_dir,
             actions,
+            submenu: false,
+            anchored: true,
         });
         self.overlay = Overlay::FileMenu { selected: 0 };
     }
@@ -1154,6 +1653,16 @@ impl App {
         let Some(action) = menu.actions.get(index).copied() else {
             return;
         };
+        if action == FileAction::Export {
+            // Stay in the menu, now listing the formats.
+            self.file_menu = Some(FileMenu {
+                actions: vec![FileAction::ExportHtml, FileAction::ExportPdf],
+                submenu: true,
+                ..menu
+            });
+            self.overlay = Overlay::FileMenu { selected: 0 };
+            return;
+        }
         self.close_file_menu();
         let shown = |what: &str| format!("{what}: {}", menu.name);
         let launched = |app: &mut App, program: Launch, path: &Path, what: &str| {
@@ -1189,7 +1698,186 @@ impl App {
                 self.clipboard_note = Some(format!("Copied name: {}", menu.name));
                 self.clipboard = Some(menu.name.clone());
             }
+            FileAction::Export => {}
+            FileAction::ExportHtml => self.start_export(&menu.path, Format::Html),
+            FileAction::ExportPdf => self.start_export(&menu.path, Format::Pdf),
         }
+    }
+
+    /// `Y`: copy the Markdown source behind the text selected in the viewer.
+    fn copy_selection_as_markdown(&mut self) {
+        let Some(selection) = self.ended_selection.take().filter(|selection| selection.done && !selection.is_empty()) else {
+            self.set_status("Select text in the document with the mouse first, then press Y");
+            return;
+        };
+        if selection.area != self.layout.viewer {
+            self.set_status("The selection is not in the document");
+            return;
+        }
+        let rows = self.viewer.doc.lines.len();
+        let top = self.viewer.top;
+        let row_of = |y: u16| top + usize::from(y.saturating_sub(selection.area.y));
+        let first = row_of(selection.anchor.1.min(selection.head.1));
+        let last = row_of(selection.anchor.1.max(selection.head.1));
+        if first >= rows {
+            self.set_status("The selection is empty");
+            return;
+        }
+        let last = last.min(rows - 1);
+        let Some(range) = self.viewer.source_range_of_rows(first, last) else {
+            self.set_status("Nothing to copy as Markdown here");
+            return;
+        };
+        let Some(text) = self.viewer.source_lines(range.start, range.end) else {
+            self.set_status("Nothing to copy as Markdown here");
+            return;
+        };
+        let (from, to) = (range.start + 1, range.end + 1);
+        let place = if from == to { format!("line {from}") } else { format!("lines {from}-{to}") };
+        let what = if self.viewer.markdown_file() { "Markdown" } else { "source" };
+        self.clipboard_note = Some(if range.exact {
+            format!("Copied {what}: {place}")
+        } else {
+            format!("Copied {place} as whole blocks: the selection could not be mapped exactly")
+        });
+        self.clipboard = Some(text);
+    }
+
+    /// Leave the Export submenu: back to the file's actions, on `Export...`.
+    fn back_to_file_actions(&mut self) {
+        let Some(menu) = self.file_menu.take() else {
+            self.overlay = Overlay::None;
+            return;
+        };
+        let mut actions = vec![
+            FileAction::Open,
+            FileAction::VsCode,
+            FileAction::Terminal,
+            FileAction::DefaultApp,
+            FileAction::Edit,
+            FileAction::CopyPath,
+            FileAction::CopyName,
+            FileAction::Export,
+        ];
+        if !menu.anchored {
+            // Opened by the shortcut: there is no menu behind it.
+            self.overlay = Overlay::None;
+            return;
+        }
+        let selected = actions.len() - 1;
+        actions.retain(|action| *action != FileAction::Edit);
+        let selected = selected.min(actions.len() - 1);
+        self.file_menu = Some(FileMenu {
+            actions,
+            submenu: false,
+            ..menu
+        });
+        self.overlay = Overlay::FileMenu { selected };
+    }
+
+    // ---------------------------------------------------------------- export
+
+    /// Where the export of `source` is written: the configured folder, or the
+    /// folder of the original.
+    pub fn export_dir_for(&self, source: &Path) -> PathBuf {
+        let configured = self
+            .config
+            .export_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        match configured {
+            Some(text) => {
+                let expanded = match text.strip_prefix("~/").or_else(|| (text == "~").then_some("")) {
+                    Some(rest) => dirs::home_dir().map_or_else(|| PathBuf::from(text), |home| home.join(rest)),
+                    None => PathBuf::from(text),
+                };
+                if expanded.is_absolute() {
+                    expanded
+                } else {
+                    self.root.join(expanded)
+                }
+            }
+            None => source.parent().map(Path::to_path_buf).unwrap_or_else(|| self.root.clone()),
+        }
+    }
+
+    /// Export `source` on a background thread; the result goes to the status bar.
+    pub fn start_export(&mut self, source: &Path, format: Format) {
+        if self.export_job.is_some() {
+            self.set_status("An export is already running");
+            return;
+        }
+        let request = export::Request {
+            source: source.to_path_buf(),
+            root: self.root.clone(),
+            format,
+            out_dir: self.export_dir_for(source),
+            theme: self.theme(),
+            path_var: self
+                .export_path_var
+                .clone()
+                .or_else(|| std::env::var_os("PATH"))
+                .unwrap_or_default(),
+            timeout: export::CONVERTER_TIMEOUT,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("rtui-export".to_string())
+            .spawn(move || {
+                let _ = sender.send(export::run(&request));
+            });
+        match spawned {
+            Ok(_) => {
+                self.export_job = Some(receiver);
+                self.set_status(format!("Exporting {}…", format.label()));
+            }
+            Err(error) => self.set_status(format!("Cannot export: {error}")),
+        }
+    }
+
+    fn poll_export(&mut self) {
+        let Some(receiver) = &self.export_job else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(outcome) => {
+                self.export_job = None;
+                if outcome.written.is_some() {
+                    // A new file appeared: the explorer and the finder should know.
+                    self.finder.invalidate();
+                    self.explorer.refresh();
+                }
+                self.set_status(outcome.message);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.export_job = None;
+                self.set_status("The export stopped unexpectedly");
+            }
+        }
+    }
+
+    /// The shortcut: export the open document (HTML or PDF, asked in a menu).
+    fn open_export_menu(&mut self) {
+        let Some(loaded) = self.viewer.loaded.clone() else {
+            self.set_status("No file open to export");
+            return;
+        };
+        let name = loaded
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.file_menu = Some(FileMenu {
+            path: loaded.path.clone(),
+            name,
+            is_dir: false,
+            actions: vec![FileAction::ExportHtml, FileAction::ExportPdf],
+            submenu: true,
+            anchored: false,
+        });
+        self.overlay = Overlay::FileMenu { selected: 0 };
     }
 
     /// Copy the code block under the cursor.  Returns false when the cursor is
@@ -1469,8 +2157,8 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        // Typing ends a text selection.
-        self.selection = None;
+        // Typing ends a text selection.  `Y` still needs to know what it was.
+        self.ended_selection = self.selection.take();
 
         if self.capturing_prefix {
             self.handle_prefix_capture(key);
@@ -1534,6 +2222,14 @@ impl App {
 
     /// Paste text into the focused terminal or editor.
     pub fn paste(&mut self, text: &str) {
+        // Pasting into the file finder types into its query.
+        if let Overlay::Finder { .. } = self.overlay {
+            for character in text.chars().filter(|character| !character.is_control()) {
+                self.finder.type_char(character);
+            }
+            self.overlay = Overlay::Finder { selected: 0 };
+            return;
+        }
         if self.focus == Focus::Terminal {
             if let Some(term) = &mut self.term {
                 term.send_paste(text);
@@ -1570,6 +2266,12 @@ impl App {
                     self.overlay = Overlay::Outline { selected };
                 }
             }
+            Action::FindFile => self.open_finder(),
+            Action::Backlinks => self.open_backlinks(),
+            Action::Export => self.open_export_menu(),
+            Action::CopyMarkdown => self.copy_selection_as_markdown(),
+            Action::Bookmark => self.toggle_bookmark(),
+            Action::Bookmarks => self.open_bookmarks(),
             Action::Search => self.start_search(),
             Action::SearchNext => {
                 if !self.viewer.search_next() {
@@ -1592,11 +2294,15 @@ impl App {
             Action::CycleIcons => self.cycle_icons(),
             Action::Refresh => match self.focus {
                 Focus::Explorer => {
+                    self.finder.invalidate();
+                    self.backlinks.invalidate();
                     self.explorer.refresh();
                     self.preview_selection();
                     self.set_status("Project tree refreshed");
                 }
                 Focus::Viewer => {
+                    self.finder.invalidate();
+                    self.backlinks.invalidate();
                     self.explorer.refresh();
                     self.reload_current();
                 }
@@ -1873,6 +2579,14 @@ impl App {
                 self.overlay = Overlay::Outline { selected: index };
                 self.press_overlay_key(KeyCode::Enter);
             }
+            (Overlay::Finder { .. }, Some(Hit::Finder(index))) => self.choose_finder_hit(index),
+            (Overlay::Backlinks { .. }, Some(Hit::Backlink(index))) => self.choose_backlink(index),
+            (Overlay::Bookmarks { tab, .. }, Some(Hit::BookmarkRow(index))) => {
+                self.choose_list_entry(tab, index)
+            }
+            (Overlay::Bookmarks { .. }, Some(Hit::BookmarkTab(tab))) => {
+                self.overlay = Overlay::Bookmarks { tab, selected: 0 }
+            }
             (Overlay::Links { .. }, Some(Hit::Link(index))) => self.choose_link(index),
             (Overlay::FileMenu { .. }, Some(Hit::FileAction(index))) => self.choose_file_action(index),
             (_, None) if self.outside_popups(x, y) => self.press_overlay_key(KeyCode::Esc),
@@ -2072,9 +2786,16 @@ impl App {
                     selected: next.min(count.saturating_sub(1)),
                 };
             }
+            Overlay::Finder { selected } => self.handle_finder_key(key, selected),
+            Overlay::Backlinks { selected } => self.handle_backlinks_key(key, selected),
+            Overlay::Bookmarks { tab, selected } => self.handle_bookmarks_key(key, tab, selected),
             Overlay::FileMenu { selected } => {
                 let count = self.file_menu.as_ref().map_or(0, |menu| menu.actions.len());
+                let submenu = self.file_menu.as_ref().is_some_and(|menu| menu.submenu);
                 match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') if submenu => self.back_to_file_actions(),
+                    KeyCode::Char('h') if submenu => self.choose_file_action(0),
+                    KeyCode::Char('p') if submenu => self.choose_file_action(1),
                     KeyCode::Esc | KeyCode::Char('q') => self.close_file_menu(),
                     KeyCode::Down | KeyCode::Char('j') => {
                         self.overlay = Overlay::FileMenu {
@@ -2372,9 +3093,10 @@ impl App {
                         .as_ref()
                         .is_some_and(|loaded| loaded.path == path)
                     {
-                        self.load_into_viewer(path, None, true);
+                        self.load_into_viewer(path.clone(), None, true);
                     }
                     self.focus = Focus::Viewer;
+                    self.note_recent(&path);
                 } else {
                     self.preview_selection();
                     if let Some(explorer_rect) = self.layout.explorer {
@@ -2542,6 +3264,8 @@ impl App {
     /// Called after the external editor exits: refresh the tree and the open
     /// document so the edits are immediately visible.
     pub fn after_editor(&mut self, path: &Path) {
+        self.finder.invalidate();
+        self.backlinks.invalidate();
         self.explorer.refresh();
         if self
             .viewer
@@ -2581,7 +3305,7 @@ impl Default for App {
 
 /// Does a link target start with a URL scheme (`javascript:`, `file:`, …)?
 /// Single letters are drive names (`C:\\notes`), not schemes.
-fn has_url_scheme(target: &str) -> bool {
+pub(crate) fn has_url_scheme(target: &str) -> bool {
     let Some((scheme, _)) = target.split_once(':') else {
         return false;
     };
@@ -2773,6 +3497,7 @@ mod tests {
                 FileAction::Edit,
                 FileAction::CopyPath,
                 FileAction::CopyName,
+                FileAction::Export,
             ]
         );
         press(&mut app, KeyCode::Esc);
@@ -4856,5 +5581,1630 @@ mod tests {
         send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 8, y);
         send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 8, y);
         assert_eq!(open_name(&app), before);
+    }
+    // ------------------------------------------------------------- finder
+
+    fn deep_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/ui")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("README.md"), b"# Home\n\nWelcome.\n").unwrap();
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        fs::write(root.join("src/ui/mod.rs"), b"pub mod x;\n").unwrap();
+        fs::write(root.join("docs/guide.md"), b"# Guide\n").unwrap();
+        fs::write(root.join("target/junk.rs"), b"x\n").unwrap();
+        fs::write(root.join(".hidden.md"), b"# Hidden\n").unwrap();
+        fs::write(root.join(".gitignore"), b"target/\n").unwrap();
+        dir
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for character in text.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+    }
+
+    fn open_finder_and_wait(app: &mut App) {
+        press_ctrl(app, 'p');
+        assert!(matches!(app.overlay, Overlay::Finder { .. }), "Ctrl+P opens the finder");
+        tick_until(app, "the index", |app| !app.finder.is_scanning());
+    }
+
+    fn hit_paths(app: &App) -> Vec<String> {
+        app.finder.hits().iter().map(|hit| hit.path.clone()).collect()
+    }
+
+    fn finder_selected(app: &App) -> usize {
+        match app.overlay {
+            Overlay::Finder { selected } => selected,
+            other => panic!("the finder is not open: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_finder_and_typing_filters_the_files() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        assert_eq!(
+            hit_paths(&app),
+            vec!["docs/guide.md", "README.md", "src/main.rs", "src/ui/mod.rs"],
+            "an empty query lists the project, ignoring target/ and hidden files"
+        );
+        type_text(&mut app, "mod");
+        assert_eq!(hit_paths(&app)[0], "src/ui/mod.rs");
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("Find file"), "{screen}");
+        assert!(screen.contains("src/ui/mod.rs"), "{screen}");
+        assert!(screen.contains("mod"), "the query is shown");
+    }
+
+    #[test]
+    fn enter_opens_the_file_and_reveals_its_row_in_the_explorer() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        draw_now(&mut app);
+        let visible_names = |app: &App| -> Vec<String> {
+            app.explorer
+                .visible()
+                .iter()
+                .filter_map(|&i| app.explorer.tree.node(i).map(|node| node.name.clone()))
+                .collect()
+        };
+        assert!(!visible_names(&app).contains(&"mod.rs".to_string()), "src/ui starts folded");
+        open_finder_and_wait(&mut app);
+        type_text(&mut app, "uimod");
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(open_name(&app), "mod.rs");
+        let wanted = dir.path().join("src/ui/mod.rs");
+        tick_until(&mut app, "the explorer to reveal the file", |app| {
+            app.explorer.selected_path().as_deref() == Some(wanted.as_path())
+        });
+        assert_eq!(app.focus, Focus::Viewer);
+        // The folders on the way were opened.
+        let names = visible_names(&app);
+        assert!(names.contains(&"ui".to_string()) && names.contains(&"mod.rs".to_string()), "{names:?}");
+        // It counts as a navigation: Ctrl+O goes back to the README.
+        press_ctrl(&mut app, 'o');
+        assert_eq!(open_name(&app), "README.md");
+    }
+
+    #[test]
+    fn escape_closes_the_finder_and_does_not_open_the_menu() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        type_text(&mut app, "ma");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(!app.should_quit);
+        // A second Esc is the usual one: it opens the main menu.
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.overlay, Overlay::Menu { .. }));
+        // Opening the finder again starts with an empty query.
+        press(&mut app, KeyCode::Esc);
+        press_ctrl(&mut app, 'p');
+        assert!(app.finder.query.is_empty());
+    }
+
+    #[test]
+    fn q_is_a_letter_inside_the_finder_and_ctrl_c_does_nothing() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.should_quit, "q types a letter here");
+        assert_eq!(app.finder.query, "q");
+        press_ctrl(&mut app, 'c');
+        assert!(!app.should_quit);
+        assert!(matches!(app.overlay, Overlay::Finder { .. }), "Ctrl+C does nothing");
+        assert_eq!(app.finder.query, "q");
+        // Once the finder is closed, q quits as always.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn arrows_stay_inside_the_results_and_typing_goes_back_to_the_top() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        let count = app.finder.hits().len();
+        assert_eq!(count, 4);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(finder_selected(&app), 0, "no wrapping above the first result");
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(finder_selected(&app), count - 1, "no wrapping below the last one");
+        press(&mut app, KeyCode::Home);
+        assert_eq!(finder_selected(&app), 0);
+        press(&mut app, KeyCode::End);
+        assert_eq!(finder_selected(&app), count - 1);
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(finder_selected(&app), 0);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(finder_selected(&app), count - 1);
+        press_ctrl(&mut app, 'p');
+        assert_eq!(finder_selected(&app), count - 2, "Ctrl+P / Ctrl+N move like in fzf");
+        press_ctrl(&mut app, 'n');
+        assert_eq!(finder_selected(&app), count - 1);
+        type_text(&mut app, "s");
+        assert_eq!(finder_selected(&app), 0, "a new query starts at the best match");
+    }
+
+    #[test]
+    fn enter_opens_the_highlighted_result_not_the_first() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        type_text(&mut app, "rs");
+        let paths = hit_paths(&app);
+        assert!(paths.len() >= 2, "{paths:?}");
+        press(&mut app, KeyCode::Down);
+        let wanted = paths[1].clone();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.viewer.loaded.as_ref().unwrap().path, dir.path().join(wanted));
+    }
+
+    #[test]
+    fn backspace_ctrl_u_and_ctrl_w_edit_the_query() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        type_text(&mut app, "src main");
+        assert_eq!(app.finder.query, "src main");
+        press_ctrl(&mut app, 'w');
+        assert_eq!(app.finder.query, "src ");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.finder.query, "src");
+        press_ctrl(&mut app, 'u');
+        assert_eq!(app.finder.query, "");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.finder.query, "", "backspace on an empty query is harmless");
+        assert_eq!(app.finder.hits().len(), 4);
+    }
+
+    #[test]
+    fn enter_without_results_keeps_the_finder_open() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        type_text(&mut app, "zzzzzz");
+        assert!(app.finder.hits().is_empty());
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("no matches"), "{screen}");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::PageDown);
+        assert!(matches!(app.overlay, Overlay::Finder { .. }));
+        assert_eq!(open_name(&app), "README.md", "nothing was opened");
+    }
+
+    #[test]
+    fn an_empty_project_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("no files in this project"), "{screen}");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.overlay, Overlay::Finder { .. }));
+    }
+
+    #[test]
+    fn clicking_a_result_opens_it() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        type_text(&mut app, "guide");
+        draw_now(&mut app);
+        click_on(&mut app, Hit::Finder(0));
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(open_name(&app), "guide.md");
+    }
+
+    #[test]
+    fn the_wheel_moves_the_selection_and_a_click_outside_closes() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        draw_now(&mut app);
+        wheel(&mut app, true);
+        wheel(&mut app, true);
+        assert_eq!(finder_selected(&app), 2);
+        wheel(&mut app, false);
+        assert_eq!(finder_selected(&app), 1);
+        // The top-left corner of the screen is outside the popup.
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn clicks_on_the_input_or_the_frame_do_not_close_the_finder() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        draw_now(&mut app);
+        let frame = rect_of(&app, Hit::Panel);
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), frame.x + 5, frame.y + 1);
+        assert!(matches!(app.overlay, Overlay::Finder { .. }));
+    }
+
+    #[test]
+    fn the_mouse_option_off_ignores_clicks_in_the_finder() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        draw_now(&mut app);
+        app.config.mouse = false;
+        let rect = rect_of(&app, Hit::Finder(0));
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), rect.x + 4, rect.y);
+        assert!(matches!(app.overlay, Overlay::Finder { .. }));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.overlay, Overlay::None, "the keyboard still works");
+    }
+
+    #[test]
+    fn indexing_is_shown_while_the_scan_runs_and_results_arrive_after() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        app.finder.set_scan_limits(Duration::from_millis(400), crate::finder::MAX_INDEXED_FILES);
+        press_ctrl(&mut app, 'p');
+        assert!(app.finder.is_scanning());
+        assert!(app.is_busy(), "the event loop must keep ticking while it indexes");
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("indexing…"), "{screen}");
+        assert!(app.finder.hits().is_empty());
+        // The interface is not blocked: keys still work while indexing.
+        type_text(&mut app, "mod");
+        assert_eq!(app.finder.query, "mod");
+        tick_until(&mut app, "the index", |app| !app.finder.is_scanning());
+        assert_eq!(hit_paths(&app)[0], "src/ui/mod.rs", "the query typed while indexing is applied");
+        let screen = draw_now(&mut app);
+        assert!(!screen.contains("indexing…"), "{screen}");
+        assert!(!app.is_busy());
+    }
+
+    #[test]
+    fn the_finder_follows_the_hidden_and_gitignore_settings_of_the_explorer() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        assert!(!hit_paths(&app).contains(&".hidden.md".to_string()));
+        press(&mut app, KeyCode::Esc);
+
+        app.toggle_hidden();
+        open_finder_and_wait(&mut app);
+        assert!(hit_paths(&app).contains(&".hidden.md".to_string()));
+        press(&mut app, KeyCode::Esc);
+
+        app.toggle_gitignore();
+        open_finder_and_wait(&mut app);
+        assert!(hit_paths(&app).contains(&"target/junk.rs".to_string()));
+    }
+
+    #[test]
+    fn files_created_later_show_up_after_a_refresh_or_a_watcher_event() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        press(&mut app, KeyCode::Esc);
+
+        fs::write(dir.path().join("fresh.md"), b"# fresh\n").unwrap();
+        // Without any signal the cached index is reused.
+        open_finder_and_wait(&mut app);
+        assert!(!hit_paths(&app).contains(&"fresh.md".to_string()));
+        press(&mut app, KeyCode::Esc);
+
+        // `r` in the explorer refreshes the tree and the index.
+        app.focus = Focus::Explorer;
+        press(&mut app, KeyCode::Char('r'));
+        open_finder_and_wait(&mut app);
+        assert!(hit_paths(&app).contains(&"fresh.md".to_string()));
+        press(&mut app, KeyCode::Esc);
+
+        // The background watcher invalidates it too.
+        fs::write(dir.path().join("watched.md"), b"# watched\n").unwrap();
+        tick_until(&mut app, "the watcher to invalidate the index", |app| {
+            app.explorer.tree.find_path(&dir.path().join("watched.md")).is_some()
+        });
+        open_finder_and_wait(&mut app);
+        assert!(hit_paths(&app).contains(&"watched.md".to_string()));
+    }
+
+    #[test]
+    fn a_file_deleted_after_indexing_is_reported_and_nothing_breaks() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        fs::remove_file(dir.path().join("docs/guide.md")).unwrap();
+        type_text(&mut app, "guide");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.status_text().is_some_and(|text| text.contains("No longer exists")));
+        assert_eq!(open_name(&app), "README.md");
+    }
+
+    #[test]
+    fn find_file_can_be_rebound_and_the_prefix_works_too() {
+        let dir = deep_project();
+        let mut config = Config::default();
+        config
+            .keys
+            .insert("find_file".into(), crate::keymap::KeySpec::One("ctrl+g".into()));
+        let mut rebound = App::with_config(Some(dir.path()), config);
+        rebound.set_terminal_area(Rect::new(0, 0, 100, 30));
+        press_ctrl(&mut rebound, 'p');
+        assert_eq!(rebound.overlay, Overlay::None, "the old binding is gone");
+        press_ctrl(&mut rebound, 'g');
+        assert!(matches!(rebound.overlay, Overlay::Finder { .. }));
+        press(&mut rebound, KeyCode::Esc);
+
+        // The default configuration also has `prefix f` (it works from the
+        // terminal and the editor, which only let the prefix through).
+        let mut default_app = app(&dir);
+        prefix_then(&mut default_app, KeyCode::Char('f'));
+        assert!(matches!(default_app.overlay, Overlay::Finder { .. }));
+    }
+
+    #[test]
+    fn pasting_types_into_the_finder_query() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        app.paste("src/\nmain");
+        assert_eq!(app.finder.query, "src/main", "control characters are dropped");
+        assert_eq!(hit_paths(&app)[0], "src/main.rs");
+        assert_eq!(finder_selected(&app), 0);
+    }
+
+    #[test]
+    fn the_help_lists_the_finder_shortcut() {
+        let app = App::default();
+        let help = crate::ui::help::rendered_text(&app.keymap);
+        assert!(help.contains("Ctrl+P"), "{help}");
+        assert!(help.contains("Find a file"), "{help}");
+    }
+
+    #[test]
+    fn long_paths_keep_their_file_name_and_tiny_terminals_do_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a_very_long_folder_name/another_quite_long_folder/third_folder_here");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("target_file.md"), b"# t\n").unwrap();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        type_text(&mut app, "tf");
+        let narrow = crate::ui::render_to_text_for_test(&mut app, 50, 20);
+        assert!(narrow.contains("target_file.md"), "{narrow}");
+        assert!(narrow.contains('…'), "the start of the path is elided\n{narrow}");
+        for (width, height) in [(20, 5), (30, 8), (1, 1), (40, 6)] {
+            let _ = crate::ui::render_to_text_for_test(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn the_matching_characters_are_drawn_highlighted() {
+        let dir = deep_project();
+        let mut app = app(&dir);
+        open_finder_and_wait(&mut app);
+        type_text(&mut app, "mod");
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rect = rect_of(&app, Hit::Finder(0));
+        let mut highlighted = String::new();
+        for x in rect.x..rect.right() {
+            let cell = &buffer[(x, rect.y)];
+            if cell.modifier.contains(ratatui::style::Modifier::UNDERLINED) {
+                highlighted.push_str(cell.symbol());
+            }
+        }
+        assert_eq!(highlighted, "mod");
+    }
+
+    // ------------------------------------------------- bookmarks and recents
+
+    fn app_with_state(dir: &tempfile::TempDir, state_file: &Path) -> App {
+        let mut app = App::with_config(Some(dir.path()), Config::default());
+        app.state_path = Some(state_file.to_path_buf());
+        app.project_state = state::load(state_file, &app.root);
+        app.set_terminal_area(Rect::new(0, 0, 100, 30));
+        app
+    }
+
+    fn state_file(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("..").join(format!(
+            "state-{}.toml",
+            dir.path().file_name().unwrap().to_string_lossy()
+        ))
+    }
+
+    fn bookmarks(app: &App) -> Vec<(String, usize)> {
+        app.project_state
+            .bookmarks
+            .iter()
+            .map(|bookmark| (bookmark.file.clone(), bookmark.line))
+            .collect()
+    }
+
+    fn list_state(app: &App) -> (ListTab, usize) {
+        match app.overlay {
+            Overlay::Bookmarks { tab, selected } => (tab, selected),
+            other => panic!("the bookmarks popup is not open: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m_bookmarks_the_current_line_and_again_removes_it() {
+        let dir = project();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(bookmarks(&app), vec![("README.md".to_string(), 1)]);
+        assert_eq!(app.project_state.bookmarks[0].text, "# Home");
+        assert!(app.status_text().is_some_and(|text| text.contains("Bookmarked README.md:1")));
+        press(&mut app, KeyCode::Char('m'));
+        assert!(bookmarks(&app).is_empty());
+        assert!(app.status_text().is_some_and(|text| text.contains("Bookmark removed")));
+    }
+
+    #[test]
+    fn the_bookmark_follows_the_line_of_the_source_not_the_row() {
+        let dir = project();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        let details = app.viewer.doc.headings.iter().find(|h| h.text == "Details").unwrap().line;
+        app.viewer.jump_to_line(details);
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(bookmarks(&app), vec![("README.md".to_string(), 5)], "`## Details` is line 5");
+        assert_eq!(app.project_state.bookmarks[0].text, "## Details");
+        // A different width flows the document differently; the line stays.
+        app.set_terminal_area(Rect::new(0, 0, 50, 30));
+        let row = app.viewer.row_of_source_line(4).unwrap();
+        assert_eq!(app.viewer.source_line_at(row), Some(4));
+    }
+
+    #[test]
+    fn plain_and_code_files_bookmark_their_real_lines_even_when_they_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "word ".repeat(60);
+        fs::write(dir.path().join("long.txt"), format!("first\n{long}\ntail\n")).unwrap();
+        let code: String = (1..=12).map(|n| format!("let value_{n} = {n};\n")).collect();
+        fs::write(dir.path().join("code.rs"), code).unwrap();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+
+        app.open_file(dir.path().join("long.txt"), None, true);
+        let last_row = app.viewer.doc.lines.len() - 1;
+        app.viewer.jump_to_line(last_row);
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(bookmarks(&app), vec![("long.txt".to_string(), 3)], "`tail` is line 3");
+        // A row in the middle of the wrapped line is line 2.
+        let middle = app.viewer.row_of_source_line(1).unwrap() + 1;
+        app.viewer.jump_to_line(middle);
+        press(&mut app, KeyCode::Char('m'));
+        assert!(bookmarks(&app).contains(&("long.txt".to_string(), 2)));
+
+        app.open_file(dir.path().join("code.rs"), None, true);
+        let row = app.viewer.row_of_source_line(6).expect("line 7 is rendered");
+        app.viewer.jump_to_line(row);
+        press(&mut app, KeyCode::Char('m'));
+        assert!(bookmarks(&app).contains(&("code.rs".to_string(), 7)));
+        let bookmark = app.project_state.bookmarks.iter().find(|b| b.file == "code.rs").unwrap();
+        assert_eq!(bookmark.text, "let value_7 = 7;");
+    }
+
+    #[test]
+    fn bookmarks_need_an_open_file_inside_the_project() {
+        let dir = project();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("elsewhere.md"), "# Elsewhere\n").unwrap();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        app.open_file(outside.path().join("elsewhere.md"), None, true);
+        press(&mut app, KeyCode::Char('m'));
+        assert!(bookmarks(&app).is_empty());
+        assert!(app.status_text().is_some_and(|text| text.contains("inside the project")));
+        assert!(app.project_state.recent.is_empty(), "files outside the project are not recent");
+
+        let mut app = app_with_state(&dir, &file);
+        app.viewer.loaded = None;
+        app.show_welcome();
+        press(&mut app, KeyCode::Char('m'));
+        assert!(bookmarks(&app).is_empty());
+        assert!(app.status_text().is_some_and(|text| text.contains("No file open")));
+    }
+
+    #[test]
+    fn bookmarks_and_recent_files_persist_relative_to_the_project() {
+        let dir = project();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        app.open_file(dir.path().join("notes/guide.md"), None, true);
+        press(&mut app, KeyCode::Char('m'));
+        drop(app);
+
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(text.contains("notes/guide.md"), "{text}");
+        assert!(!text.contains(&format!("{}/notes", dir.path().display())), "no absolute file paths: {text}");
+
+        let again = app_with_state(&dir, &file);
+        assert_eq!(bookmarks(&again), vec![("notes/guide.md".to_string(), 1)]);
+        assert_eq!(again.project_state.recent, vec!["notes/guide.md"]);
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_corrupt_state_file_never_stops_the_app() {
+        let dir = project();
+        let file = state_file(&dir);
+        fs::write(&file, "][ not toml").unwrap();
+        let mut app = app_with_state(&dir, &file);
+        assert!(app.project_state.bookmarks.is_empty());
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(bookmarks(&app).len(), 1);
+        let again = app_with_state(&dir, &file);
+        assert_eq!(bookmarks(&again).len(), 1, "the state was rewritten");
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_file(file.with_extension("toml.corrupt"));
+    }
+
+    #[test]
+    fn files_that_disappeared_are_dropped_when_the_state_is_read() {
+        let dir = project();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        app.open_file(dir.path().join("notes/guide.md"), None, true);
+        press(&mut app, KeyCode::Char('m'));
+        drop(app);
+        fs::remove_file(dir.path().join("notes/guide.md")).unwrap();
+        let again = app_with_state(&dir, &file);
+        assert!(again.project_state.bookmarks.is_empty());
+        assert!(!again.project_state.recent.contains(&"notes/guide.md".to_string()));
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn the_popup_lists_bookmarks_and_enter_jumps_to_the_file_and_line() {
+        let dir = project();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        app.open_file(dir.path().join("plain.txt"), None, true);
+        let row = app.viewer.row_of_source_line(1).unwrap();
+        app.viewer.jump_to_line(row);
+        press(&mut app, KeyCode::Char('m'));
+        app.open_file(dir.path().join("README.md"), None, true);
+        assert_eq!(open_name(&app), "README.md");
+
+        press(&mut app, KeyCode::Char('\''));
+        assert_eq!(list_state(&app), (ListTab::Bookmarks, 0));
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("plain.txt:2"), "{screen}");
+        assert!(screen.contains("world"), "the excerpt of the line is shown\n{screen}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(open_name(&app), "plain.txt");
+        assert_eq!(app.viewer.source_line_at(app.viewer.cursor), Some(1));
+        assert_eq!(app.focus, Focus::Viewer);
+        // The jump is a navigation: Ctrl+O comes back.
+        press_ctrl(&mut app, 'o');
+        assert_eq!(open_name(&app), "README.md");
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn jumping_inside_the_same_file_moves_the_cursor_and_keeps_history() {
+        let dir = project();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        let details = app.viewer.doc.headings.iter().find(|h| h.text == "Details").unwrap().line;
+        app.viewer.jump_to_line(details);
+        press(&mut app, KeyCode::Char('m'));
+        app.viewer.jump_to_line(0);
+        press(&mut app, KeyCode::Char('\''));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.viewer.cursor, details);
+        press_ctrl(&mut app, 'o');
+        assert_eq!(app.viewer.cursor, 0, "back to where the jump started");
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn d_deletes_a_bookmark_and_the_selection_stays_in_range() {
+        let dir = project();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        for name in ["README.md", "plain.txt", "notes/guide.md"] {
+            app.open_file(dir.path().join(name), None, true);
+            press(&mut app, KeyCode::Char('m'));
+        }
+        assert_eq!(app.project_state.bookmarks.len(), 3);
+        press(&mut app, KeyCode::Char('\''));
+        press(&mut app, KeyCode::End);
+        assert_eq!(list_state(&app).1, 2);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.project_state.bookmarks.len(), 2);
+        assert_eq!(list_state(&app).1, 1, "the selection moved up with the list");
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.project_state.bookmarks.is_empty());
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(list_state(&app), (ListTab::Bookmarks, 0), "d on an empty list is harmless");
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("No bookmarks yet"), "{screen}");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.overlay, Overlay::Bookmarks { .. }));
+        // The deletions were saved.
+        let again = app_with_state(&dir, &file);
+        assert!(again.project_state.bookmarks.is_empty());
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn recent_files_are_most_recent_first_and_limited_to_twenty() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..25 {
+            fs::write(dir.path().join(format!("f{index:02}.md")), format!("# {index}\n")).unwrap();
+        }
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        assert!(app.project_state.recent.is_empty(), "the README-less start opens nothing");
+        for index in 0..25 {
+            app.open_file(dir.path().join(format!("f{index:02}.md")), None, true);
+        }
+        assert_eq!(app.project_state.recent.len(), 20);
+        assert_eq!(app.project_state.recent[0], "f24.md");
+        assert_eq!(app.project_state.recent[19], "f05.md");
+        // Opening one again moves it to the front without duplicating it.
+        app.open_file(dir.path().join("f10.md"), None, true);
+        assert_eq!(app.project_state.recent[0], "f10.md");
+        assert_eq!(app.project_state.recent.iter().filter(|f| *f == "f10.md").count(), 1);
+
+        press(&mut app, KeyCode::Char('\''));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(list_state(&app), (ListTab::Recent, 0));
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("f10.md") && screen.contains("Recent (20)"), "{screen}");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(open_name(&app), "f24.md");
+        assert_eq!(app.project_state.recent[0], "f24.md");
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn tab_switches_lists_in_both_directions_and_d_forgets_a_recent_file() {
+        let dir = project();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        app.open_file(dir.path().join("plain.txt"), None, true);
+        press(&mut app, KeyCode::Char('\''));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(list_state(&app).0, ListTab::Recent);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(list_state(&app).0, ListTab::Bookmarks);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(list_state(&app).0, ListTab::Recent);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.project_state.recent.is_empty());
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn browsing_with_the_arrows_does_not_count_as_opening_a_file() {
+        let dir = project();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        draw_now(&mut app);
+        app.focus = Focus::Explorer;
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert!(app.project_state.recent.is_empty(), "previews are not opens");
+        // Space opens: that does.
+        let (x, y) = explorer_row(&app, "plain.txt");
+        app.explorer.select_position(app.explorer.visible().iter().position(|&i| app.explorer.tree.node(i).unwrap().name == "plain.txt").unwrap());
+        let _ = (x, y);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.project_state.recent, vec!["plain.txt"]);
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn only_a_file_given_on_the_command_line_counts_at_startup() {
+        let dir = project();
+        // The README opened by default is not something the user chose.
+        let app = app(&dir);
+        assert!(app.project_state.recent.is_empty());
+        // An explicit file is.
+        let file = state_file(&dir);
+        let mut app = App::with_config(Some(&dir.path().join("plain.txt")), Config::default());
+        app.state_path = Some(file.clone());
+        assert_eq!(open_name(&app), "plain.txt");
+        app.note_recent(&dir.path().join("plain.txt"));
+        assert_eq!(app.project_state.recent, vec!["plain.txt"]);
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn choosing_an_entry_whose_file_vanished_removes_it_and_says_so() {
+        let dir = project();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        app.open_file(dir.path().join("plain.txt"), None, true);
+        press(&mut app, KeyCode::Char('m'));
+        app.open_file(dir.path().join("README.md"), None, true);
+        press(&mut app, KeyCode::Char('\''));
+        // The file disappears while the popup is already open.
+        fs::remove_file(dir.path().join("plain.txt")).unwrap();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.status_text().is_some_and(|text| text.contains("No longer exists: plain.txt")));
+        assert!(app.project_state.bookmarks.is_empty());
+        assert_eq!(open_name(&app), "README.md");
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn the_popup_closes_with_esc_or_q_and_ctrl_c_does_nothing() {
+        let dir = project();
+        let mut app = app(&dir);
+        press(&mut app, KeyCode::Char('\''));
+        press_ctrl(&mut app, 'c');
+        assert!(matches!(app.overlay, Overlay::Bookmarks { .. }));
+        assert!(!app.should_quit);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        press(&mut app, KeyCode::Char('\''));
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(!app.should_quit, "q closes the popup, as in every popup");
+        let screen = {
+            press(&mut app, KeyCode::Char('\''));
+            draw_now(&mut app)
+        };
+        assert!(screen.contains("No bookmarks yet"), "{screen}");
+        press(&mut app, KeyCode::Tab);
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("No recent files yet"), "{screen}");
+    }
+
+    #[test]
+    fn mouse_picks_tabs_and_rows_and_the_wheel_moves() {
+        let dir = project();
+        let file = state_file(&dir);
+        let mut app = app_with_state(&dir, &file);
+        app.open_file(dir.path().join("plain.txt"), None, true);
+        app.open_file(dir.path().join("notes/guide.md"), None, true);
+        press(&mut app, KeyCode::Char('\''));
+        draw_now(&mut app);
+        click_on(&mut app, Hit::BookmarkTab(ListTab::Recent));
+        assert_eq!(list_state(&app), (ListTab::Recent, 0));
+        draw_now(&mut app);
+        wheel(&mut app, true);
+        assert_eq!(list_state(&app).1, 1);
+        click_on(&mut app, Hit::BookmarkRow(1));
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(open_name(&app), "plain.txt");
+
+        press(&mut app, KeyCode::Char('\''));
+        draw_now(&mut app);
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert_eq!(app.overlay, Overlay::None, "a click outside closes it");
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn the_keys_are_configurable_and_listed_in_the_help() {
+        let dir = project();
+        let mut config = Config::default();
+        config.keys.insert("bookmark".into(), crate::keymap::KeySpec::One("b".into()));
+        config.keys.insert("bookmarks".into(), crate::keymap::KeySpec::One("ctrl+b".into()));
+        let mut custom = App::with_config(Some(dir.path()), config);
+        custom.set_terminal_area(Rect::new(0, 0, 100, 30));
+        press(&mut custom, KeyCode::Char('m'));
+        assert!(custom.project_state.bookmarks.is_empty(), "m is no longer bound");
+        press(&mut custom, KeyCode::Char('b'));
+        assert_eq!(custom.project_state.bookmarks.len(), 1);
+        press_ctrl(&mut custom, 'b');
+        assert!(matches!(custom.overlay, Overlay::Bookmarks { .. }));
+
+        let default = App::default();
+        let help = crate::ui::help::rendered_text(&default.keymap);
+        assert!(help.contains("Bookmark the current line"), "{help}");
+        assert!(help.contains("Bookmarks and recent files"), "{help}");
+    }
+
+    #[test]
+    fn m_and_the_apostrophe_are_text_in_the_search_prompt_and_the_finder() {
+        let dir = project();
+        let mut app = app(&dir);
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('\''));
+        assert_eq!(app.search_input.as_deref(), Some("m'"));
+        assert!(app.project_state.bookmarks.is_empty());
+        press(&mut app, KeyCode::Esc);
+        press_ctrl(&mut app, 'p');
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('\''));
+        assert_eq!(app.finder.query, "m'");
+        assert!(app.project_state.bookmarks.is_empty());
+    }
+
+    // ----------------------------------------------------------- backlinks
+
+    fn link_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join("README.md"),
+            "# Home\n\nIntro text.\n\n- [the guide](docs/guide.md) is first\n- see also [[guide|alias]] and [other](docs/other.md#top)\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/guide.md"), "# Guide\n\nBack to [home](../README.md).\n").unwrap();
+        fs::write(
+            root.join("docs/other.md"),
+            "# Other\n\nSee [guide](guide.md) and [missing](nope.md).\n",
+        )
+        .unwrap();
+        fs::write(root.join("orphan.md"), "# Orphan\n").unwrap();
+        dir
+    }
+
+    fn index_links(app: &mut App) {
+        app.started_at = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .unwrap_or_else(Instant::now);
+        tick_until(app, "the link index", |app| {
+            app.backlinks.is_ready() && !app.backlinks.is_scanning()
+        });
+    }
+
+    fn open_in(app: &mut App, dir: &tempfile::TempDir, file: &str) {
+        app.open_file(dir.path().join(file), None, true);
+        assert_eq!(app.viewer.loaded.as_ref().map(|l| l.path.clone()), Some(dir.path().join(file)));
+    }
+
+    fn backlink_selected(app: &App) -> usize {
+        match app.overlay {
+            Overlay::Backlinks { selected } => selected,
+            other => panic!("the backlinks popup is not open: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_status_bar_counts_the_backlinks_of_the_open_file() {
+        let dir = link_project();
+        let mut app = app(&dir);
+        open_in(&mut app, &dir, "docs/guide.md");
+        assert_eq!(app.backlink_count(), None, "nothing is known before the first build");
+        assert!(!draw_now(&mut app).contains("backlink"));
+        index_links(&mut app);
+        assert_eq!(app.backlink_count(), Some(3));
+        assert!(draw_now(&mut app).contains("3 backlinks"));
+        open_in(&mut app, &dir, "README.md");
+        assert_eq!(app.backlink_count(), Some(1));
+        assert!(draw_now(&mut app).contains("1 backlink "), "singular");
+        open_in(&mut app, &dir, "orphan.md");
+        assert!(draw_now(&mut app).contains("0 backlinks"));
+    }
+
+    #[test]
+    fn b_lists_who_links_here_with_the_line_of_each_link() {
+        let dir = link_project();
+        let mut app = app(&dir);
+        open_in(&mut app, &dir, "docs/guide.md");
+        index_links(&mut app);
+        press(&mut app, KeyCode::Char('B'));
+        assert_eq!(backlink_selected(&app), 0);
+        let entries: Vec<(String, usize)> =
+            app.current_backlinks().iter().map(|b| (b.source.clone(), b.line)).collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("docs/other.md".to_string(), 2),
+                ("README.md".to_string(), 4),
+                ("README.md".to_string(), 5),
+            ],
+            "wikilinks with an alias count, the broken link is ignored"
+        );
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("Backlinks") && screen.contains("docs/guide.md"), "{screen}");
+        assert!(screen.contains("docs/other.md:3"), "lines are shown 1-based\n{screen}");
+        assert!(screen.contains("README.md:5") && screen.contains("README.md:6"), "{screen}");
+        assert!(screen.contains("[the guide](docs/guide.md) is first"), "the text of the line\n{screen}");
+        assert!(screen.contains("3 links"), "{screen}");
+    }
+
+    #[test]
+    fn enter_opens_the_source_file_at_the_line_of_the_link() {
+        let dir = link_project();
+        let mut app = app(&dir);
+        open_in(&mut app, &dir, "docs/guide.md");
+        index_links(&mut app);
+        press(&mut app, KeyCode::Char('B'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(backlink_selected(&app), 2);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(open_name(&app), "README.md");
+        let row = app.viewer.doc.lines[app.viewer.cursor].text();
+        assert!(row.contains("alias"), "the cursor is on the list item with the [[wikilink]]: {row:?}");
+        assert_eq!(app.focus, Focus::Viewer);
+        // It is a navigation: Ctrl+O goes back to the guide.
+        press_ctrl(&mut app, 'o');
+        assert_eq!(open_name(&app), "guide.md");
+    }
+
+    #[test]
+    fn navigation_keys_stay_in_range_and_the_popup_closes_with_esc_or_q() {
+        let dir = link_project();
+        let mut app = app(&dir);
+        open_in(&mut app, &dir, "docs/guide.md");
+        index_links(&mut app);
+        press(&mut app, KeyCode::Char('B'));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(backlink_selected(&app), 0);
+        press(&mut app, KeyCode::End);
+        assert_eq!(backlink_selected(&app), 2);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(backlink_selected(&app), 2);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(backlink_selected(&app), 0);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(backlink_selected(&app), 0);
+        press_ctrl(&mut app, 'c');
+        assert!(matches!(app.overlay, Overlay::Backlinks { .. }) && !app.should_quit);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        press(&mut app, KeyCode::Char('B'));
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn a_file_nobody_links_to_says_so() {
+        let dir = link_project();
+        let mut app = app(&dir);
+        open_in(&mut app, &dir, "orphan.md");
+        index_links(&mut app);
+        press(&mut app, KeyCode::Char('B'));
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("No other file links to this one."), "{screen}");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.overlay, Overlay::Backlinks { .. }), "Enter on an empty list does nothing");
+    }
+
+    #[test]
+    fn the_popup_shows_indexing_until_the_index_is_ready_and_then_fills_in() {
+        let dir = link_project();
+        let mut app = app(&dir);
+        open_in(&mut app, &dir, "docs/guide.md");
+        app.backlinks.set_walk_delay(Duration::from_millis(400));
+        press(&mut app, KeyCode::Char('B'));
+        assert!(app.backlinks.is_scanning(), "asking for it starts the build at once");
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("indexing"), "{screen}");
+        assert!(app.current_backlinks().is_empty());
+        press(&mut app, KeyCode::Down);
+        assert!(matches!(app.overlay, Overlay::Backlinks { .. }), "the interface stays responsive");
+        tick_until(&mut app, "the index", |app| app.backlinks.is_ready());
+        let screen = draw_now(&mut app);
+        assert!(!screen.contains("indexing"), "{screen}");
+        assert!(screen.contains("docs/other.md:3"), "{screen}");
+    }
+
+    #[test]
+    fn the_start_up_build_waits_for_the_first_frames() {
+        let dir = link_project();
+        let mut app = app(&dir);
+        app.tick();
+        assert!(!app.backlinks.is_scanning(), "nothing runs in the first moments");
+        index_links(&mut app);
+        assert!(app.backlinks.is_ready());
+    }
+
+    #[test]
+    fn mouse_picks_a_backlink_and_a_click_outside_closes() {
+        let dir = link_project();
+        let mut app = app(&dir);
+        open_in(&mut app, &dir, "docs/guide.md");
+        index_links(&mut app);
+        press(&mut app, KeyCode::Char('B'));
+        draw_now(&mut app);
+        wheel(&mut app, true);
+        assert_eq!(backlink_selected(&app), 1);
+        click_on(&mut app, Hit::Backlink(0));
+        assert_eq!(open_name(&app), "other.md");
+        assert_eq!(app.viewer.source_line_at(app.viewer.cursor), Some(2));
+
+        open_in(&mut app, &dir, "docs/guide.md");
+        press(&mut app, KeyCode::Char('B'));
+        draw_now(&mut app);
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn editing_links_updates_the_count_after_a_refresh() {
+        let dir = link_project();
+        let mut app = app(&dir);
+        app.backlinks.set_test_limits(Duration::ZERO, crate::backlinks::Limits::default());
+        open_in(&mut app, &dir, "orphan.md");
+        index_links(&mut app);
+        assert_eq!(app.backlink_count(), Some(0));
+
+        fs::write(dir.path().join("docs/new.md"), "# New\n\n[orphan](../orphan.md)\n").unwrap();
+        app.focus = Focus::Explorer;
+        press(&mut app, KeyCode::Char('r'));
+        tick_until(&mut app, "the rebuilt index", |app| app.backlink_count() == Some(1));
+        assert_eq!(app.current_backlinks()[0].source, "docs/new.md");
+
+        // Removing the link takes the backlink away again.
+        fs::write(dir.path().join("docs/new.md"), "# New, with no link at all\n").unwrap();
+        app.focus = Focus::Explorer;
+        press(&mut app, KeyCode::Char('r'));
+        tick_until(&mut app, "the rebuilt index", |app| app.backlink_count() == Some(0));
+    }
+
+    #[test]
+    fn the_watcher_invalidates_the_link_index_too() {
+        let dir = link_project();
+        let mut app = app(&dir);
+        app.backlinks.set_test_limits(Duration::ZERO, crate::backlinks::Limits::default());
+        open_in(&mut app, &dir, "orphan.md");
+        index_links(&mut app);
+        fs::write(dir.path().join("fresh.md"), "[o](orphan.md)\n").unwrap();
+        tick_until(&mut app, "the watcher to report it", |app| app.backlink_count() == Some(1));
+    }
+
+    #[test]
+    fn b_needs_a_file_inside_the_project() {
+        let dir = link_project();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("far.md"), "# Far\n").unwrap();
+        let mut app = app(&dir);
+        app.show_welcome();
+        press(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.status_text().is_some_and(|text| text.contains("No file open")));
+        app.open_file(outside.path().join("far.md"), None, true);
+        press(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.status_text().is_some_and(|text| text.contains("inside the project")));
+        assert_eq!(app.backlink_count(), None);
+    }
+
+    #[test]
+    fn a_source_that_vanished_is_reported() {
+        let dir = link_project();
+        let mut app = app(&dir);
+        open_in(&mut app, &dir, "docs/guide.md");
+        index_links(&mut app);
+        press(&mut app, KeyCode::Char('B'));
+        fs::remove_file(dir.path().join("docs/other.md")).unwrap();
+        press(&mut app, KeyCode::Enter);
+        assert!(app.status_text().is_some_and(|text| text.contains("No longer exists: docs/other.md")));
+        assert_eq!(open_name(&app), "guide.md");
+    }
+
+    #[test]
+    fn the_key_is_configurable_and_a_letter_in_text_prompts() {
+        let dir = link_project();
+        let mut config = Config::default();
+        config.keys.insert("backlinks".into(), crate::keymap::KeySpec::One("ctrl+b".into()));
+        let mut custom = App::with_config(Some(dir.path()), config);
+        custom.set_terminal_area(Rect::new(0, 0, 100, 30));
+        press(&mut custom, KeyCode::Char('B'));
+        assert_eq!(custom.overlay, Overlay::None, "B is no longer bound");
+        press_ctrl(&mut custom, 'b');
+        assert!(matches!(custom.overlay, Overlay::Backlinks { .. }));
+
+        let mut plain = app(&dir);
+        press(&mut plain, KeyCode::Char('/'));
+        press(&mut plain, KeyCode::Char('B'));
+        assert_eq!(plain.search_input.as_deref(), Some("B"));
+        assert_eq!(plain.overlay, Overlay::None);
+
+        let help = crate::ui::help::rendered_text(&App::default().keymap);
+        assert!(help.contains("Files that link to the open file"), "{help}");
+    }
+
+    // ------------------------------------------------------ export and copy
+
+    fn export_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("guide.md"), "# Guide\n\nSome *text* and a [link](other.md).\n\n```rust\nfn main() {}\n```\n").unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        fs::create_dir(dir.path().join("folder")).unwrap();
+        fs::write(dir.path().join("folder/inner.md"), "# Inner\n").unwrap();
+        dir
+    }
+
+    fn select_in_explorer(app: &mut App, name: &str) {
+        draw_now(app);
+        app.focus = Focus::Explorer;
+        let position = app
+            .explorer
+            .visible()
+            .iter()
+            .position(|&index| app.explorer.tree.node(index).is_some_and(|node| node.name == name))
+            .unwrap_or_else(|| panic!("{name} is not in the explorer"));
+        app.explorer.select_position(position);
+    }
+
+    fn menu_actions(app: &App) -> Vec<FileAction> {
+        app.file_menu.as_ref().expect("a file menu").actions.clone()
+    }
+
+    fn wait_for_export(app: &mut App) -> String {
+        tick_until(app, "the export", |app| app.export_job.is_none());
+        app.status_text().unwrap_or_default().to_string()
+    }
+
+    fn without_converters() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn the_file_menu_has_an_export_entry_with_html_and_pdf_choices() {
+        let dir = export_project();
+        let mut app = app(&dir);
+        select_in_explorer(&mut app, "guide.md");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(menu_actions(&app).last(), Some(&FileAction::Export));
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("Export..."), "{screen}");
+
+        let index = menu_actions(&app).len() - 1;
+        press(&mut app, KeyCode::End);
+        for _ in 0..index {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.overlay, Overlay::FileMenu { selected: 0 }, "the menu stays open on the formats");
+        assert_eq!(menu_actions(&app), vec![FileAction::ExportHtml, FileAction::ExportPdf]);
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("HTML") && screen.contains("PDF") && screen.contains("Export: guide.md"), "{screen}");
+    }
+
+    #[test]
+    fn folders_have_no_export_entry() {
+        let dir = export_project();
+        let mut app = app(&dir);
+        select_in_explorer(&mut app, "folder");
+        press(&mut app, KeyCode::Enter);
+        assert!(!menu_actions(&app).contains(&FileAction::Export));
+    }
+
+    #[test]
+    fn esc_in_the_export_choices_goes_back_to_the_actions_and_then_closes() {
+        let dir = export_project();
+        let mut app = app(&dir);
+        select_in_explorer(&mut app, "guide.md");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('8'));
+        assert!(app.file_menu.as_ref().unwrap().submenu);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.file_menu.as_ref().unwrap().submenu, "back to the file's actions");
+        assert!(menu_actions(&app).contains(&FileAction::Export));
+        let Overlay::FileMenu { selected } = app.overlay else { panic!("the menu closed") };
+        assert_eq!(menu_actions(&app)[selected], FileAction::Export, "the cursor is on Export...");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.file_menu.is_none());
+    }
+
+    #[test]
+    fn exporting_html_from_the_menu_writes_next_to_the_original_and_says_where() {
+        let dir = export_project();
+        let mut app = app(&dir);
+        select_in_explorer(&mut app, "guide.md");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('8'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.status_text().is_some_and(|text| text.contains("Exporting HTML")));
+        let status = wait_for_export(&mut app);
+        let written = dir.path().join("guide.html");
+        assert!(status.contains("Exported HTML") && status.contains(&written.display().to_string()), "{status}");
+        let html = fs::read_to_string(&written).unwrap();
+        assert!(html.contains("<h1 id=\"guide\">Guide</h1>") && html.contains("<style>"));
+        // The explorer and the finder pick the new file up.
+        app.tick();
+        let names: Vec<String> = app
+            .explorer
+            .visible()
+            .iter()
+            .filter_map(|&i| app.explorer.tree.node(i).map(|node| node.name.clone()))
+            .collect();
+        assert!(names.contains(&"guide.html".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn h_and_p_pick_a_format_in_the_export_choices_and_clicks_work() {
+        let dir = export_project();
+        let none = without_converters();
+        let mut app = app(&dir);
+        app.export_path_var = Some(none.path().as_os_str().to_os_string());
+        select_in_explorer(&mut app, "guide.md");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('8'));
+        press(&mut app, KeyCode::Char('h'));
+        assert!(wait_for_export(&mut app).contains("Exported HTML"));
+
+        select_in_explorer(&mut app, "guide.md");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('8'));
+        draw_now(&mut app);
+        click_on(&mut app, Hit::FileAction(1));
+        let status = wait_for_export(&mut app);
+        assert!(status.contains("PDF export needs"), "p / the second row is PDF: {status}");
+    }
+
+    #[test]
+    fn pdf_without_a_converter_says_what_is_missing_and_keeps_the_html() {
+        let dir = export_project();
+        let none = without_converters();
+        let mut app = app(&dir);
+        app.export_path_var = Some(none.path().as_os_str().to_os_string());
+        app.start_export(&dir.path().join("guide.md"), Format::Pdf);
+        let status = wait_for_export(&mut app);
+        for program in ["wkhtmltopdf", "chromium", "weasyprint"] {
+            assert!(status.contains(program), "{status}");
+        }
+        assert!(status.contains("Wrote HTML instead") && status.contains("guide.html"), "{status}");
+        assert!(dir.path().join("guide.html").is_file());
+        assert!(!dir.path().join("guide.pdf").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pdf_uses_the_converter_found_in_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = export_project();
+        let bin = tempfile::tempdir().unwrap();
+        let script = bin.path().join("wkhtmltopdf");
+        fs::write(&script, "#!/bin/sh\nfor last; do :; done\nprintf '%%PDF-1.4 fake' > \"$last\"\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut app = app(&dir);
+        app.export_path_var = Some(bin.path().as_os_str().to_os_string());
+        app.start_export(&dir.path().join("guide.md"), Format::Pdf);
+        assert!(app.status_text().is_some_and(|text| text.contains("Exporting PDF")));
+        let status = wait_for_export(&mut app);
+        assert!(status.starts_with("Exported PDF (wkhtmltopdf)"), "{status}");
+        assert!(status.contains(&dir.path().join("guide.pdf").display().to_string()));
+        assert!(fs::read(dir.path().join("guide.pdf")).unwrap().starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn the_shortcut_exports_the_open_document() {
+        let dir = export_project();
+        let none = without_converters();
+        let mut app = app(&dir);
+        app.export_path_var = Some(none.path().as_os_str().to_os_string());
+        app.open_file(dir.path().join("guide.md"), None, true);
+        press(&mut app, KeyCode::Char('X'));
+        assert!(matches!(app.overlay, Overlay::FileMenu { .. }));
+        let screen = draw_now(&mut app);
+        assert!(screen.contains("Export: guide.md"), "{screen}");
+        press(&mut app, KeyCode::Enter);
+        assert!(wait_for_export(&mut app).contains("Exported HTML"));
+        assert!(dir.path().join("guide.html").is_file());
+
+        // Esc closes the menu: there is no actions menu behind the shortcut.
+        press(&mut app, KeyCode::Char('X'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.file_menu.is_none());
+    }
+
+    #[test]
+    fn the_export_shortcut_needs_an_open_file_and_is_configurable() {
+        let dir = export_project();
+        let mut app = app(&dir);
+        app.show_welcome();
+        press(&mut app, KeyCode::Char('X'));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.status_text().is_some_and(|text| text.contains("No file open to export")));
+
+        let mut config = Config::default();
+        config.keys.insert("export".into(), crate::keymap::KeySpec::One("ctrl+g".into()));
+        let mut custom = App::with_config(Some(dir.path()), config);
+        custom.set_terminal_area(Rect::new(0, 0, 100, 30));
+        custom.open_file(dir.path().join("guide.md"), None, true);
+        press(&mut custom, KeyCode::Char('X'));
+        assert_eq!(custom.overlay, Overlay::None, "X is no longer bound");
+        press_ctrl(&mut custom, 'g');
+        assert!(matches!(custom.overlay, Overlay::FileMenu { .. }));
+        let help = crate::ui::help::rendered_text(&App::default().keymap);
+        assert!(help.contains("Export the open document"), "{help}");
+        assert!(help.contains("Copy the source Markdown"), "{help}");
+    }
+
+    #[test]
+    fn the_export_folder_is_configurable() {
+        let dir = export_project();
+        let mut config = Config::default();
+        config.export_dir = Some("exports/out".to_string());
+        let mut app = App::with_config(Some(dir.path()), config);
+        app.set_terminal_area(Rect::new(0, 0, 100, 30));
+        let source = dir.path().join("folder/inner.md");
+        assert_eq!(app.export_dir_for(&source), dir.path().join("exports/out"), "relative: from the project root");
+        app.start_export(&source, Format::Html);
+        let status = wait_for_export(&mut app);
+        assert!(status.contains(&dir.path().join("exports/out/inner.html").display().to_string()), "{status}");
+        assert!(dir.path().join("exports/out/inner.html").is_file());
+
+        let absolute = tempfile::tempdir().unwrap();
+        app.config.export_dir = Some(absolute.path().display().to_string());
+        assert_eq!(app.export_dir_for(&source), absolute.path());
+        if let Some(home) = dirs::home_dir() {
+            app.config.export_dir = Some("~/rtui-exports".into());
+            assert_eq!(app.export_dir_for(&source), home.join("rtui-exports"));
+        }
+        app.config.export_dir = Some("   ".into());
+        assert_eq!(app.export_dir_for(&source), dir.path().join("folder"), "blank means next to the original");
+        app.config.export_dir = None;
+        assert_eq!(app.export_dir_for(&source), dir.path().join("folder"));
+    }
+
+    #[test]
+    fn source_files_export_and_a_second_export_waits_for_the_first() {
+        let dir = export_project();
+        let mut app = app(&dir);
+        app.start_export(&dir.path().join("main.rs"), Format::Html);
+        app.start_export(&dir.path().join("main.rs"), Format::Html);
+        assert!(app.status_text().is_some_and(|text| text.contains("already running")));
+        let status = wait_for_export(&mut app);
+        assert!(status.contains("main.rs.html"), "{status}");
+        assert!(fs::read_to_string(dir.path().join("main.rs.html")).unwrap().contains("fn"));
+        // Once it finished another one can start.
+        app.start_export(&dir.path().join("guide.md"), Format::Html);
+        assert!(app.export_job.is_some());
+        wait_for_export(&mut app);
+    }
+
+    #[test]
+    fn a_failed_export_is_reported_not_hidden() {
+        let dir = export_project();
+        let mut app = app(&dir);
+        app.start_export(&dir.path().join("gone.md"), Format::Html);
+        let status = wait_for_export(&mut app);
+        assert!(status.contains("Cannot export gone.md"), "{status}");
+    }
+
+    // ---------------------------------------------------- copy as Markdown
+
+    const COPY_SOURCE: &str = "# Title\n\nPlain paragraph.\n\n- apple\n- banana\n\n```rust\nlet x = 1;\nlet y = 2;\n```\n\nSee [the guide](docs/guide.md) now.\n";
+
+    fn doc_row(app: &App, needle: &str) -> usize {
+        app.viewer
+            .doc
+            .lines
+            .iter()
+            .position(|line| line.text().contains(needle))
+            .unwrap_or_else(|| panic!("no row shows {needle:?}"))
+    }
+
+    /// Drag from document row `first` to row `last` (both visible).
+    fn select_rows(app: &mut App, first: usize, last: usize) {
+        let viewer = app.layout.viewer;
+        let top = app.viewer.top;
+        let y = |row: usize| viewer.y + (row - top) as u16;
+        send_mouse(app, MouseEventKind::Down(MouseButton::Left), viewer.x + 1, y(first));
+        send_mouse(app, MouseEventKind::Drag(MouseButton::Left), viewer.x + 10, y(last));
+        send_mouse(app, MouseEventKind::Up(MouseButton::Left), viewer.x + 10, y(last));
+    }
+
+    /// Select from the row showing `from` to the row showing `to`.
+    fn select_between(app: &mut App, from: &str, to: &str) {
+        let (first, last) = (doc_row(app, from), doc_row(app, to));
+        select_rows(app, first, last);
+    }
+
+    fn copy_project() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("copy.md"), COPY_SOURCE).unwrap();
+        let mut app = app(&dir);
+        app.open_file(dir.path().join("copy.md"), None, true);
+        draw_now(&mut app);
+        let _ = app.take_clipboard();
+        (dir, app)
+    }
+
+    fn copied(app: &mut App) -> (String, String) {
+        let status = app.status_text().map(str::to_string);
+        let text = app.take_clipboard().unwrap_or_else(|| panic!("nothing was copied; status: {status:?}"));
+        let note = app.copy_status(&text);
+        (text, note)
+    }
+
+    #[test]
+    fn y_copies_the_original_markdown_not_the_rendered_text() {
+        let (_dir, mut app) = copy_project();
+        // Two lines inside the code block: exactly those source lines.
+        select_between(&mut app, "let x", "let y");
+        let _ = app.take_clipboard();
+        press(&mut app, KeyCode::Char('Y'));
+        let (text, note) = copied(&mut app);
+        assert_eq!(text, "let x = 1;\nlet y = 2;");
+        assert_eq!(note, "Copied Markdown: lines 9-10");
+
+        // A heading and the paragraph after it: both source lines, as written.
+        select_between(&mut app, "Title", "Plain paragraph");
+        press(&mut app, KeyCode::Char('Y'));
+        let (text, note) = copied(&mut app);
+        assert_eq!(text, "# Title\n\nPlain paragraph.");
+        assert_eq!(note, "Copied Markdown: lines 1-3");
+    }
+
+    #[test]
+    fn list_items_keep_their_markers_and_fences_come_along_when_selected() {
+        let (_dir, mut app) = copy_project();
+        select_between(&mut app, "apple", "banana");
+        press(&mut app, KeyCode::Char('Y'));
+        let (text, _) = copied(&mut app);
+        assert_eq!(text, "- apple\n- banana");
+
+        // From the top border of the code block to its bottom border.
+        let top = doc_row(&app, "let x") - 1;
+        let bottom = doc_row(&app, "let y") + 1;
+        select_rows(&mut app, top, bottom);
+        press(&mut app, KeyCode::Char('Y'));
+        let (text, note) = copied(&mut app);
+        assert_eq!(text, "```rust\nlet x = 1;\nlet y = 2;\n```");
+        assert_eq!(note, "Copied Markdown: lines 8-11");
+    }
+
+    #[test]
+    fn a_link_keeps_its_destination_and_the_note_says_the_block_was_copied_whole() {
+        let (_dir, mut app) = copy_project();
+        let row = doc_row(&app, "the guide");
+        select_rows(&mut app, row, row);
+        press(&mut app, KeyCode::Char('Y'));
+        let (text, note) = copied(&mut app);
+        assert_eq!(text, "See [the guide](docs/guide.md) now.");
+        assert!(note.contains("whole blocks") && note.contains("could not be mapped exactly"), "{note}");
+        assert!(note.contains("line 13"), "{note}");
+    }
+
+    #[test]
+    fn a_selection_made_upwards_or_past_the_end_still_works() {
+        let (_dir, mut app) = copy_project();
+        select_between(&mut app, "banana", "apple");
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(copied(&mut app).0, "- apple\n- banana");
+
+        // Dragging into the empty area below the document clamps to its end.
+        let viewer = app.layout.viewer;
+        let row = doc_row(&app, "the guide");
+        let y = viewer.y + (row - app.viewer.top) as u16;
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), viewer.x + 1, y);
+        send_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), viewer.x + 8, viewer.bottom() - 1);
+        send_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), viewer.x + 8, viewer.bottom() - 1);
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(copied(&mut app).0, "See [the guide](docs/guide.md) now.");
+    }
+
+    #[test]
+    fn y_without_a_usable_selection_explains_what_to_do() {
+        let (_dir, mut app) = copy_project();
+        press(&mut app, KeyCode::Char('Y'));
+        assert!(app.status_text().is_some_and(|text| text.contains("Select text in the document")));
+        assert!(app.take_clipboard().is_none());
+        // A click without a drag selects nothing.
+        let viewer = app.layout.viewer;
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), viewer.x + 2, viewer.y + 1);
+        send_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), viewer.x + 2, viewer.y + 1);
+        press(&mut app, KeyCode::Char('Y'));
+        assert!(app.take_clipboard().is_none());
+        // A drag still in progress is not a selection yet.
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), viewer.x + 2, viewer.y + 1);
+        send_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), viewer.x + 9, viewer.y + 3);
+        press(&mut app, KeyCode::Char('Y'));
+        assert!(app.take_clipboard().is_none());
+        // A selection that belongs to another pane is refused.
+        let other = Rect::new(0, 0, 5, 5);
+        let mut selection = crate::selection::Selection::new(other, 0, 0);
+        selection.drag_to(4, 3);
+        selection.done = true;
+        app.selection = Some(selection);
+        press(&mut app, KeyCode::Char('Y'));
+        assert!(app.status_text().is_some_and(|text| text.contains("not in the document")));
+        assert!(app.selection.is_none(), "the key press ended the selection");
+        assert!(app.take_clipboard().is_none());
+    }
+
+    #[test]
+    fn wrapped_plain_text_copies_the_whole_source_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "alpha ".repeat(60);
+        fs::write(dir.path().join("long.txt"), format!("first\n{long}\nlast\n")).unwrap();
+        let mut app = app(&dir);
+        app.open_file(dir.path().join("long.txt"), None, true);
+        draw_now(&mut app);
+        let _ = app.take_clipboard();
+        let wrapped = app.viewer.row_of_source_line(1).unwrap() + 1;
+        select_rows(&mut app, wrapped, wrapped);
+        press(&mut app, KeyCode::Char('Y'));
+        let (text, note) = copied(&mut app);
+        assert_eq!(text, long, "the full line, not the row");
+        assert!(note.contains("whole blocks") && note.contains("line 2"), "{note}");
+    }
+
+    #[test]
+    fn source_code_files_copy_their_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let code: String = (1..=12).map(|n| format!("let value_{n} = {n};\n")).collect();
+        fs::write(dir.path().join("code.rs"), code).unwrap();
+        let mut app = app(&dir);
+        app.open_file(dir.path().join("code.rs"), None, true);
+        draw_now(&mut app);
+        let _ = app.take_clipboard();
+        let (first, last) = (app.viewer.row_of_source_line(2).unwrap(), app.viewer.row_of_source_line(4).unwrap());
+        select_rows(&mut app, first, last);
+        press(&mut app, KeyCode::Char('Y'));
+        let (text, note) = copied(&mut app);
+        assert_eq!(text, "let value_3 = 3;\nlet value_4 = 4;\nlet value_5 = 5;");
+        assert_eq!(note, "Copied source: lines 3-5");
+    }
+
+    #[test]
+    fn rows_are_mapped_through_the_scroll_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let text: String = (1..=80).map(|n| format!("- item {n:02}\n")).collect();
+        fs::write(dir.path().join("long.md"), text).unwrap();
+        let mut app = app(&dir);
+        app.open_file(dir.path().join("long.md"), None, true);
+        draw_now(&mut app);
+        app.viewer.jump_to_line(60);
+        draw_now(&mut app);
+        assert!(app.viewer.top > 0);
+        let _ = app.take_clipboard();
+        let (first, last) = (doc_row(&app, "item 50"), doc_row(&app, "item 52"));
+        select_rows(&mut app, first, last);
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(copied(&mut app).0, "- item 50\n- item 51\n- item 52");
+    }
+
+    #[test]
+    fn y_is_a_letter_in_the_search_prompt_and_configurable() {
+        let (_dir, mut app) = copy_project();
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(app.search_input.as_deref(), Some("Y"));
+        press(&mut app, KeyCode::Esc);
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "- one\n- two\n").unwrap();
+        let mut config = Config::default();
+        config.keys.insert("copy_markdown".into(), crate::keymap::KeySpec::One("ctrl+y".into()));
+        let mut custom = App::with_config(Some(dir.path()), config);
+        custom.set_terminal_area(Rect::new(0, 0, 100, 30));
+        custom.open_file(dir.path().join("a.md"), None, true);
+        draw_now(&mut custom);
+        select_rows(&mut custom, 0, 1);
+        let _ = custom.take_clipboard();
+        press(&mut custom, KeyCode::Char('Y'));
+        assert!(custom.take_clipboard().is_none(), "Y is no longer bound");
+        // Any key ends a selection, so select again for the bound key.
+        select_rows(&mut custom, 0, 1);
+        let _ = custom.take_clipboard();
+        press_ctrl(&mut custom, 'y');
+        assert_eq!(copied(&mut custom).0, "- one\n- two");
     }
 }

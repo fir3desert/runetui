@@ -5,6 +5,9 @@
 //! lets the viewer re-flow a document on resize without re-reading or
 //! re-parsing it.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
@@ -142,9 +145,9 @@ impl LinkKind {
     }
 }
 
-/// Parse a Markdown document into blocks.  Never panics on malformed input:
-/// `pulldown-cmark` is robust and anything unknown is skipped or kept as text.
-pub fn parse(text: &str) -> Vec<Block> {
+/// The Markdown dialect every part of runetui reads (the viewer, the link
+/// index): CommonMark plus GFM, wikilinks, math, footnotes and front matter.
+pub fn markdown_options() -> Options {
     let mut options = Options::empty();
     options.insert(
         Options::ENABLE_TABLES
@@ -159,11 +162,149 @@ pub fn parse(text: &str) -> Vec<Block> {
             | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
             | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS,
     );
+    options
+}
 
+/// A link found in a Markdown source, with the line it starts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLink {
+    /// 0-based source line.
+    pub line: usize,
+    /// Destination as written (`notes/a.md#intro`, or the target of a
+    /// `[[wikilink|alias]]`).
+    pub dest: String,
+    pub kind: LinkKind,
+    /// The text the link shows (what the viewer draws for it).
+    pub label: String,
+}
+
+/// Every link of a Markdown source (not images, and nothing inside code),
+/// classified exactly as the viewer classifies them.
+pub fn scan_links(text: &str) -> Vec<SourceLink> {
+    let index = LineIndex::new(text);
+    let mut links = Vec::new();
+    let mut open: Option<SourceLink> = None;
+    for (event, range) in Parser::new_ext(text, markdown_options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            }) => {
+                let kind = if matches!(link_type, pulldown_cmark::LinkType::WikiLink { .. }) {
+                    LinkKind::Wiki
+                } else {
+                    LinkKind::classify(&dest_url)
+                };
+                open = Some(SourceLink {
+                    line: index.line_of(range.start),
+                    dest: dest_url.to_string(),
+                    kind,
+                    label: String::new(),
+                });
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some(link) = &mut open {
+                    link.label.push_str(&text);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some(link) = &mut open {
+                    link.label.push(' ');
+                }
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some(link) = open.take() {
+                    links.push(link);
+                }
+            }
+            _ => {}
+        }
+    }
+    links
+}
+
+/// Source lines of one top-level block: 0-based, both ends included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// A parsed document: the blocks and, for each top-level block, the lines of
+/// the source it came from.  `spans[i]` belongs to `blocks[i]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Parsed {
+    pub blocks: Vec<Block>,
+    pub spans: Vec<LineSpan>,
+}
+
+/// Start offset of every line of `text`, to turn byte offsets into lines.
+struct LineIndex<'a> {
+    text: &'a str,
+    starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    fn new(text: &'a str) -> Self {
+        let mut starts = vec![0];
+        starts.extend(text.match_indices('\n').map(|(index, _)| index + 1));
+        Self { text, starts }
+    }
+
+    fn line_of(&self, offset: usize) -> usize {
+        self.starts.partition_point(|start| *start <= offset).saturating_sub(1)
+    }
+
+    /// Lines covered by the byte range `start..end` (end exclusive).  Blank
+    /// lines at the end of the range (a list owns the gap after it) do not count.
+    fn span(&self, start: usize, end: usize) -> LineSpan {
+        let bytes = self.text.as_bytes();
+        let mut end = end.min(bytes.len());
+        while end > start && matches!(bytes[end - 1], b'\n' | b'\r' | b' ' | b'\t') {
+            end -= 1;
+        }
+        let first = self.line_of(start);
+        let last = self.line_of(end.saturating_sub(1).max(start)).max(first);
+        LineSpan { start: first, end: last }
+    }
+}
+
+/// Parse a Markdown document into blocks.  Never panics on malformed input:
+/// `pulldown-cmark` is robust and anything unknown is skipped or kept as text.
+#[cfg(test)]
+pub fn parse(text: &str) -> Vec<Block> {
+    parse_spanned(text).blocks
+}
+
+/// Like [`parse`], but also reports where in the source every top-level block
+/// came from (used to map rendered rows back to source lines).
+pub fn parse_spanned(text: &str) -> Parsed {
+    let options = markdown_options();
+
+    // The offset iterator reports where every event came from; the cell keeps
+    // the range of the event handed out last so the builder can read it.
+    let last = Rc::new(Cell::new((0usize, 0usize)));
+    let tracker = Rc::clone(&last);
+    let events = Parser::new_ext(text, options)
+        .into_offset_iter()
+        .map(move |(event, range)| {
+            tracker.set((range.start, range.end));
+            event
+        });
     let mut builder = Builder {
-        events: Parser::new_ext(text, options).peekable(),
+        events: events.peekable(),
+        last,
+        ranges: Vec::new(),
     };
-    builder.blocks(None)
+    let blocks = builder.blocks(None);
+    let index = LineIndex::new(text);
+    let spans = builder
+        .ranges
+        .iter()
+        .map(|(start, end)| index.span(*start, *end))
+        .collect();
+    Parsed { blocks, spans }
 }
 
 struct Builder<'a, I>
@@ -171,6 +312,10 @@ where
     I: Iterator<Item = Event<'a>>,
 {
     events: std::iter::Peekable<I>,
+    /// Byte range of the event returned by the last call to `next`.
+    last: Rc<Cell<(usize, usize)>>,
+    /// Byte range of every top-level block, in order.
+    ranges: Vec<(usize, usize)>,
 }
 
 impl<'a, I> Builder<'a, I>
@@ -183,10 +328,16 @@ where
             let Some(event) = self.events.next() else {
                 break;
             };
+            // For a block's `Start` event this is the whole block.
+            let range = self.last.get();
+            let top_level = until.is_none();
             match event {
                 Event::Start(tag) => {
                     if let Some(block) = self.block_from_tag(tag) {
                         blocks.push(block);
+                        if top_level {
+                            self.ranges.push(range);
+                        }
                     }
                 }
                 Event::End(end) => {
@@ -196,16 +347,27 @@ where
                         }
                     }
                 }
-                Event::Rule => blocks.push(Block::Rule),
+                Event::Rule => {
+                    blocks.push(Block::Rule);
+                    if top_level {
+                        self.ranges.push(range);
+                    }
+                }
                 Event::Text(text) => {
                     // Text outside a block-level container (malformed input).
                     if !text.trim().is_empty() {
                         blocks.push(Block::Paragraph(vec![Inline::Text(text.to_string())]));
+                        if top_level {
+                            self.ranges.push(range);
+                        }
                     }
                 }
                 Event::Html(html) => {
                     if !html.trim().is_empty() {
                         blocks.push(Block::Html(html.to_string()));
+                        if top_level {
+                            self.ranges.push(range);
+                        }
                     }
                 }
                 _ => {}
@@ -700,5 +862,45 @@ mod tests {
         };
         assert_eq!(*kind, QuoteKind::Note);
         assert!(matches!(blocks[1], Block::Rule));
+    }
+
+    // ------------------------------------------------------------ scan_links
+
+    #[test]
+    fn scan_links_reports_line_destination_kind_and_label() {
+        let source = "# T\n\nA [plain](a.md#x) and [web](https://e.com).\n\n- [[wiki|shown]] and [[bare]]\n\n[jump](#top)\n";
+        let links = scan_links(source);
+        let summary: Vec<_> = links
+            .iter()
+            .map(|l| (l.line, l.dest.as_str(), l.kind, l.label.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (2, "a.md#x", LinkKind::Internal, "plain"),
+                (2, "https://e.com", LinkKind::External, "web"),
+                (4, "wiki", LinkKind::Wiki, "shown"),
+                (4, "bare", LinkKind::Wiki, "bare"),
+                (6, "#top", LinkKind::Anchor, "jump"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_links_skips_images_and_code_and_handles_reference_links() {
+        let source = "![img](a.png)\n\n`[c](x.md)`\n\n```\n[d](y.md)\n```\n\n[ref][r] and `code` in [**bold** `mono`](z.md)\n\n[r]: target.md\n";
+        let links = scan_links(source);
+        let summary: Vec<_> = links.iter().map(|l| (l.line, l.dest.as_str(), l.label.as_str())).collect();
+        assert_eq!(summary, vec![(8, "target.md", "ref"), (8, "z.md", "bold mono")]);
+        assert!(scan_links("").is_empty());
+        assert!(scan_links("no links here\n").is_empty());
+    }
+
+    #[test]
+    fn a_link_that_wraps_over_lines_starts_on_its_first_line() {
+        let links = scan_links("text [one\ntwo](a.md) end\n");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].line, 0);
+        assert_eq!(links[0].label, "one two");
     }
 }

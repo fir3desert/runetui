@@ -708,6 +708,29 @@ mod tests {
     }
 
     #[test]
+    fn the_file_menu_opens_right_under_the_selected_row() {
+        let dir = project();
+        let mut app = app(&dir);
+        app.explorer.go_top();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.overlay, crate::app::Overlay::FileMenu { .. }));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let explorer = app.layout.explorer.unwrap();
+        let row = explorer.y + (app.explorer.selected_position() - app.explorer.offset()) as u16;
+        let panel = app
+            .hits
+            .borrow()
+            .iter()
+            .find(|(_, hit)| *hit == crate::app::Hit::Panel)
+            .map(|(rect, _)| *rect)
+            .unwrap();
+        assert_eq!(panel.y, row + 1, "directly below the selected entry");
+        assert!(panel.x <= explorer.x + 2);
+        assert!(panel.y + panel.height <= 40);
+    }
+
+    #[test]
     fn the_header_shows_the_clock_in_the_middle() {
         let dir = project();
         let mut app = app(&dir);

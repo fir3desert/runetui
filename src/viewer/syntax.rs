@@ -74,6 +74,25 @@ pub fn render_code_range(
     out
 }
 
+/// The number in the gutter of a code row: the row starts that source line.
+fn gutter_number(line: &RLine) -> Option<usize> {
+    let number = line.spans.first()?.text.trim().parse::<usize>().ok()?;
+    (line.spans.get(1)?.text == "│ ").then_some(number.checked_sub(1)?)
+}
+
+/// Source line (0-based) shown at `row` of a code view: the one numbered in the
+/// gutter of the row, or of the nearest row above when a long line wrapped.
+pub fn source_line_of_row(doc: &RenderedDoc, row: usize) -> Option<usize> {
+    let last = row.min(doc.lines.len().checked_sub(1)?);
+    (0..=last).rev().find_map(|row| gutter_number(&doc.lines[row]))
+}
+
+/// First row of a code view that shows source line `line` (0-based), if that
+/// part of the file has been rendered.
+pub fn row_of_source_line(doc: &RenderedDoc, line: usize) -> Option<usize> {
+    doc.lines.iter().position(|row| gutter_number(row) == Some(line))
+}
+
 /// Make the code view feel like a buffer: a subtle rule at the end.
 pub fn closing_lines(layout: CodeLayout, theme: Theme) -> Vec<RLine> {
     vec![

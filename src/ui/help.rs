@@ -110,6 +110,12 @@ pub fn sections(keymap: &Keymap) -> Vec<HelpSection> {
         HelpSection {
             title: "General",
             entries: vec![
+                entry(keymap, Action::Export, "Export the open document to HTML or PDF (also: Enter on a file, Export...)"),
+                entry(keymap, Action::CopyMarkdown, "Copy the source Markdown behind the text selected with the mouse"),
+                entry(keymap, Action::Backlinks, "Files that link to the open file (Enter opens one at the link)"),
+                entry(keymap, Action::Bookmark, "Bookmark the current line (again to remove it)"),
+                entry(keymap, Action::Bookmarks, "Bookmarks and recent files (Tab switches, Enter opens, d deletes)"),
+                entry(keymap, Action::FindFile, "Find a file: fuzzy search of the project (↑/↓ choose, Enter opens, Esc closes)"),
                 entry(keymap, Action::Help, "Show or hide this help"),
                 entry(keymap, Action::Menu, "Open the menu, or go back / close an overlay or search"),
                 fixed("In the editor", "Keys go to vim; :wq saves and returns here"),

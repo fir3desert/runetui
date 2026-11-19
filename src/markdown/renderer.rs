@@ -10,12 +10,28 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::code_highlighter::CodeHighlighter;
 use super::parser::{Block, Inline, LinkKind, ListBlock, TableAlign, TableBlock, inline_plain};
-use super::{CodeRegion, DocLink, Heading, RLine, RSpan, RenderedDoc, slugify};
+use super::parser::LineSpan;
+use super::{BlockMap, CodeRegion, DocLink, Heading, RLine, RSpan, RenderedDoc, slugify};
 use crate::ui::themes::Theme;
 
 /// Render a Markdown document.
+#[cfg(test)]
 pub fn render(
     blocks: &[Block],
+    width: usize,
+    theme: Theme,
+    highlighter: &mut CodeHighlighter,
+) -> RenderedDoc {
+    render_with_source(blocks, &[], "", width, theme, highlighter)
+}
+
+/// Render a Markdown document and remember which source lines each top-level
+/// block came from (`spans[i]` belongs to `blocks[i]`; `source` is the text
+/// they were parsed from).  Without spans the result has no source map.
+pub fn render_with_source(
+    blocks: &[Block],
+    spans: &[LineSpan],
+    source: &str,
     width: usize,
     theme: Theme,
     highlighter: &mut CodeHighlighter,
@@ -26,8 +42,72 @@ pub fn render(
         highlighter,
         out: RenderedDoc::default(),
     };
-    renderer.blocks(blocks, Ctx::new(theme));
+    let ctx = Ctx::new(theme);
+    let source_lines: Vec<&str> = if spans.is_empty() { Vec::new() } else { source.lines().collect() };
+    for (index, block) in blocks.iter().enumerate() {
+        let start = renderer.out.lines.len();
+        match block {
+            Block::Metadata => {}
+            Block::Group(children) => renderer.blocks(children, ctx),
+            other => renderer.block(other, ctx, None),
+        }
+        let end = renderer.out.lines.len();
+        if let (Some(span), true) = (spans.get(index), end > start) {
+            if let Some(map) = block_map(&renderer.out.lines, start, end, *span, &source_lines) {
+                renderer.out.blocks.push(map);
+            }
+        }
+    }
     renderer.finish()
+}
+
+/// Build the source map entry of the block rendered into rows `start..end`.
+fn block_map(
+    lines: &[RLine],
+    start: usize,
+    end: usize,
+    span: LineSpan,
+    source: &[&str],
+) -> Option<BlockMap> {
+    let content_start = (start..end).find(|row| !lines[*row].is_blank())?;
+    let mut content_end = (start..end).rfind(|row| !lines[*row].is_blank())? + 1;
+    let wanted = span.end.saturating_sub(span.start) + 1;
+    // One row per source line, and the same letters and digits on each: the
+    // block was not wrapped, folded or decorated into something else.
+    let same = |rows_end: usize| {
+        rows_end - content_start == wanted
+            && (0..wanted).all(|offset| {
+                source.get(span.start + offset).is_some_and(|line| {
+                    lines[content_start + offset]
+                        .text()
+                        .chars()
+                        .filter(|character| character.is_alphanumeric())
+                        .eq(line.chars().filter(|character| character.is_alphanumeric()))
+                })
+            })
+    };
+    let mut exact = same(content_end);
+    if !exact {
+        // A heading is followed by a rule: decoration at the end is not content.
+        let texty = (content_start..content_end)
+            .rfind(|row| lines[*row].text().chars().any(char::is_alphanumeric))
+            .map(|row| row + 1);
+        if let Some(trimmed) = texty.filter(|trimmed| *trimmed < content_end) {
+            if same(trimmed) {
+                content_end = trimmed;
+                exact = true;
+            }
+        }
+    }
+    Some(BlockMap {
+        start,
+        end,
+        content_start,
+        content_end,
+        src_start: span.start,
+        src_end: span.end,
+        exact,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +157,13 @@ impl Renderer<'_> {
             self.out.lines.pop();
         }
         self.out.links.retain(|link| link.line != usize::MAX);
+        // Trailing blank rows were dropped: keep the map inside the document.
+        let total = self.out.lines.len();
+        self.out.blocks.retain_mut(|block| {
+            block.end = block.end.min(total);
+            block.content_end = block.content_end.min(total);
+            block.start < total && block.content_start < block.content_end
+        });
         self.out
     }
 
@@ -1202,5 +1289,129 @@ mod tests {
         let lines = wrap_hard(&spans, 12);
         assert!(lines[0][0].text.starts_with("    "));
         assert!(lines.iter().all(|line| spans_width(line) <= 12));
+    }
+
+    // ------------------------------------------------------------ source map
+
+    fn render_mapped(source: &str, width: usize) -> RenderedDoc {
+        let theme = catppuccin_mocha();
+        let mut highlighter = CodeHighlighter::new();
+        let parsed = crate::markdown::parse_spanned(source);
+        render_with_source(&parsed.blocks, &parsed.spans, source, width, theme, &mut highlighter)
+    }
+
+    fn row_with(doc: &RenderedDoc, needle: &str) -> usize {
+        doc.lines
+            .iter()
+            .position(|line| line.text().contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}"))
+    }
+
+    #[test]
+    fn every_top_level_block_knows_its_source_lines() {
+        let source = "# Title\n\nfirst line\nsecond line\n\n- a\n- b\n\n```rust\nlet x = 1;\n```\n";
+        let doc = render_mapped(source, 60);
+        let spans: Vec<(usize, usize)> = doc.blocks.iter().map(|b| (b.src_start, b.src_end)).collect();
+        assert_eq!(spans, vec![(0, 0), (2, 3), (5, 6), (8, 10)]);
+        // The map is contiguous and inside the document.
+        assert!(doc.blocks.windows(2).all(|pair| pair[0].end == pair[1].start));
+        assert!(doc.blocks.iter().all(|b| b.end <= doc.lines.len()));
+    }
+
+    #[test]
+    fn unwrapped_blocks_map_row_by_row_and_code_blocks_include_their_fences() {
+        let source = "# Title\n\nfirst\n\n- apple\n- banana\n\n```rust\nlet x = 1;\nlet y = 2;\n```\n";
+        let doc = render_mapped(source, 60);
+        assert_eq!(doc.source_line_at(row_with(&doc, "Title")), Some(0));
+        assert_eq!(doc.source_line_at(row_with(&doc, "first")), Some(2));
+        assert_eq!(doc.source_line_at(row_with(&doc, "apple")), Some(4));
+        assert_eq!(doc.source_line_at(row_with(&doc, "banana")), Some(5));
+        assert_eq!(doc.source_line_at(row_with(&doc, "let x")), Some(8));
+        assert_eq!(doc.source_line_at(row_with(&doc, "let y")), Some(9));
+        assert!(doc.blocks.iter().all(|block| block.exact), "{:?}", doc.blocks);
+    }
+
+    #[test]
+    fn a_paragraph_over_several_source_lines_is_one_block() {
+        // Soft line breaks flow into one row, so the rows are not the lines.
+        let doc = render_mapped("first line\nsecond line\n", 60);
+        assert_eq!(doc.blocks.len(), 1);
+        assert!(!doc.blocks[0].exact);
+        assert_eq!(doc.source_line_at(0), Some(0));
+        let range = doc.source_range(0, 0).unwrap();
+        assert_eq!((range.start, range.end, range.exact), (0, 1, false));
+    }
+
+    #[test]
+    fn rows_and_source_lines_map_back_and_forth() {
+        let source = "# Title\n\npara\n\n- one\n- two\n\nlast\n";
+        let doc = render_mapped(source, 60);
+        for line in [0usize, 2, 4, 5, 7] {
+            let row = doc.row_of_source_line(line).expect("a row");
+            assert_eq!(doc.source_line_at(row), Some(line), "line {line}");
+        }
+        // A blank source line leads to the next block; past the end, to the last.
+        assert_eq!(doc.row_of_source_line(1), doc.row_of_source_line(2));
+        assert_eq!(doc.row_of_source_line(999), doc.row_of_source_line(7));
+    }
+
+    #[test]
+    fn wrapped_paragraphs_fall_back_to_the_whole_block() {
+        let source = "# T\n\nthis paragraph is long enough that it has to be wrapped over several rows\n";
+        let doc = render_mapped(source, 24);
+        let paragraph = doc.blocks.iter().find(|b| b.src_start == 2).unwrap();
+        assert!(!paragraph.exact);
+        assert!(paragraph.content_end - paragraph.content_start > 1);
+        for row in paragraph.content_start..paragraph.content_end {
+            assert_eq!(doc.source_line_at(row), Some(2));
+        }
+        let range = doc.source_range(paragraph.content_start + 1, paragraph.content_start + 1).unwrap();
+        assert_eq!((range.start, range.end, range.exact), (2, 2, false));
+    }
+
+    #[test]
+    fn links_and_tables_are_not_claimed_to_be_exact() {
+        let source = "see [the guide](notes/guide.md) now\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let doc = render_mapped(source, 60);
+        assert_eq!(doc.blocks.len(), 2);
+        assert!(!doc.blocks[0].exact, "the url is not shown, so the text differs");
+        assert!(!doc.blocks[1].exact, "a table is drawn with its own borders");
+        assert_eq!(doc.source_range(row_with(&doc, "guide"), row_with(&doc, "guide")).unwrap().start, 0);
+    }
+
+    #[test]
+    fn source_ranges_cover_exact_selections_and_whole_blocks_across_blocks() {
+        let source = "alpha\n\n- item one\n- item two\n- item three\n\ntail\n";
+        let doc = render_mapped(source, 60);
+        // Inside one exact block: precisely the selected lines.
+        let range = doc.source_range(row_with(&doc, "item one"), row_with(&doc, "item two")).unwrap();
+        assert_eq!((range.start, range.end, range.exact), (2, 3, true));
+        // Across blocks, ending inside the list: exact as well.
+        let range = doc.source_range(row_with(&doc, "alpha"), row_with(&doc, "item two")).unwrap();
+        assert_eq!((range.start, range.end, range.exact), (0, 3, true));
+        // Backwards selections are the same selection.
+        let backwards = doc.source_range(row_with(&doc, "item two"), row_with(&doc, "alpha")).unwrap();
+        assert_eq!(backwards, range);
+        let range = doc.source_range(row_with(&doc, "item three"), row_with(&doc, "tail")).unwrap();
+        assert_eq!((range.start, range.end, range.exact), (4, 6, true));
+        // Rows past the end of the document map to nothing.
+        assert!(doc.source_range(10_000, 10_001).is_none());
+    }
+
+    #[test]
+    fn front_matter_hides_its_rows_but_keeps_the_numbers_right() {
+        let source = "---\ntitle: x\n---\n\n# Real heading\n\ntext\n";
+        let doc = render_mapped(source, 60);
+        assert_eq!(doc.source_line_at(row_with(&doc, "Real heading")), Some(4));
+        assert_eq!(doc.source_line_at(row_with(&doc, "text")), Some(6));
+    }
+
+    #[test]
+    fn a_document_without_spans_has_no_source_map() {
+        let doc = render_str("# T\n\ntext\n", 60);
+        assert!(doc.blocks.is_empty());
+        assert_eq!(doc.source_line_at(0), None);
+        assert_eq!(doc.row_of_source_line(0), None);
+        assert_eq!(doc.source_range(0, 1), None);
     }
 }

@@ -136,6 +136,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             ));
         }
     }
+    if let Some(count) = app.backlink_count() {
+        right.push(Span::styled(
+            format!(" {count} backlink{} ", if count == 1 { "" } else { "s" }),
+            if count > 0 {
+                Style::default().fg(theme.accent)
+            } else {
+                theme.muted()
+            },
+        ));
+    }
     if app.viewer.has_document() {
         if let Some(loaded) = &app.viewer.loaded {
             right.push(Span::styled(

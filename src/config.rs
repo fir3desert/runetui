@@ -54,6 +54,10 @@ pub struct Config {
     /// Show the repository's GitHub star count in the Esc menu.  This is the
     /// only network request runetui makes; turn it off to stay fully offline.
     pub show_stars: bool,
+    /// Folder for exported HTML and PDF files.  Relative paths are relative to
+    /// the project root and `~/` is the home folder.  Unset: next to the
+    /// original file.
+    pub export_dir: Option<String>,
     /// Prefix key for two-key shortcuts (tmux style), e.g. `ctrl+r`.
     pub prefix: String,
     /// Shortcut bindings, one entry per action (see `keymap`).  Keep this the
@@ -78,6 +82,7 @@ impl Default for Config {
             mouse: true,
             banner_animation: true,
             show_stars: true,
+            export_dir: None,
             prefix: keymap::DEFAULT_PREFIX.to_string(),
             keys: keymap::default_specs(),
         }
@@ -221,6 +226,18 @@ pub fn resolve_initial_file(cli_path: Option<&Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_export_folder_is_optional_and_read_from_the_file() {
+        assert_eq!(Config::default().export_dir, None);
+        let config: Config = toml::from_str("export_dir = \"exports\"\n").unwrap();
+        assert_eq!(config.export_dir.as_deref(), Some("exports"));
+        // Unset, it is not written at all.
+        let text = toml::to_string(&Config::default()).unwrap();
+        assert!(!text.contains("export_dir"), "{text}");
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("export_dir = \"exports\""), "{text}");
+    }
 
     #[test]
     fn defaults_are_sane() {

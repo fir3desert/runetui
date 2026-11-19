@@ -18,7 +18,9 @@ pub mod toc;
 use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
 
-pub use parser::{LinkKind, parse};
+pub use parser::{LineSpan, LinkKind, SourceLink, markdown_options, parse_spanned, scan_links};
+#[cfg(test)]
+pub use parser::parse;
 
 /// A complete, width-specific rendering of a document.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -28,6 +30,37 @@ pub struct RenderedDoc {
     pub links: Vec<DocLink>,
     /// Fenced/indented code blocks, so Enter or Space on one can copy it.
     pub code_blocks: Vec<CodeRegion>,
+    /// Which source lines each top-level block of the document came from, in
+    /// row order.  Empty when the renderer was not given the source.
+    pub blocks: Vec<BlockMap>,
+}
+
+/// Where a top-level block of the rendered document came from in the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockMap {
+    /// Rendered rows of the block (end exclusive), blank separators included.
+    pub start: usize,
+    pub end: usize,
+    /// The rows that actually hold content (end exclusive).
+    pub content_start: usize,
+    pub content_end: usize,
+    /// Source lines, 0-based and both ends included.
+    pub src_start: usize,
+    pub src_end: usize,
+    /// Content row `content_start + i` is exactly source line `src_start + i`
+    /// (checked against the text, so wrapped or re-flowed blocks are not).
+    pub exact: bool,
+}
+
+/// A stretch of source lines found for some rendered rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceRange {
+    /// 0-based, both ends included.
+    pub start: usize,
+    pub end: usize,
+    /// False when the rows could only be mapped to whole blocks, so the range
+    /// may hold more than was selected.
+    pub exact: bool,
 }
 
 /// A code block's place in the rendered document and its raw source text.
@@ -42,6 +75,75 @@ pub struct CodeRegion {
 }
 
 impl RenderedDoc {
+    /// The block that owns rendered row `row`.
+    fn block_of_row(&self, row: usize) -> Option<&BlockMap> {
+        let index = self.blocks.partition_point(|block| block.start <= row);
+        let block = self.blocks.get(index.checked_sub(1)?)?;
+        (row < block.end).then_some(block)
+    }
+
+    /// Source line shown at rendered row `row` (the first line of the block
+    /// when the block cannot be mapped row by row).
+    pub fn source_line_at(&self, row: usize) -> Option<usize> {
+        let block = self.block_of_row(row)?;
+        Some(block_line(block, row))
+    }
+
+    /// First rendered row that shows source line `line`.  A line between two
+    /// blocks (blank) leads to the next block.
+    pub fn row_of_source_line(&self, line: usize) -> Option<usize> {
+        let block = self
+            .blocks
+            .iter()
+            .find(|block| line <= block.src_end)
+            .or(self.blocks.last())?;
+        if line < block.src_start {
+            return Some(block.content_start);
+        }
+        Some(if block.exact {
+            (block.content_start + (line - block.src_start)).min(block.content_end - 1)
+        } else {
+            block.content_start
+        })
+    }
+
+    /// Within the block that holds source line `line`, the first row whose
+    /// text contains `needle`.  Used to land on a link inside a block that
+    /// can only be mapped as a whole.
+    pub fn row_of_text_in_block(&self, line: usize, needle: &str) -> Option<usize> {
+        if needle.is_empty() {
+            return None;
+        }
+        let block = self
+            .blocks
+            .iter()
+            .find(|block| block.src_start <= line && line <= block.src_end)?;
+        (block.content_start..block.content_end)
+            .find(|row| self.lines.get(*row).is_some_and(|line| line.text().contains(needle)))
+    }
+
+    /// Source lines behind the rendered rows `first..=last`.
+    pub fn source_range(&self, first: usize, last: usize) -> Option<SourceRange> {
+        let (first, last) = if first <= last { (first, last) } else { (last, first) };
+        let top = self.block_of_row(first)?;
+        let bottom = self.block_of_row(last).or_else(|| self.blocks.last())?;
+        if std::ptr::eq(top, bottom) {
+            if top.exact {
+                let start = block_line(top, first);
+                let end = block_line(top, last);
+                return Some(SourceRange { start, end, exact: true });
+            }
+            return Some(SourceRange { start: top.src_start, end: top.src_end, exact: false });
+        }
+        let start = if top.exact { block_line(top, first) } else { top.src_start };
+        let end = if bottom.exact { block_line(bottom, last) } else { bottom.src_end };
+        Some(SourceRange {
+            start,
+            end: end.max(start),
+            exact: top.exact && bottom.exact,
+        })
+    }
+
     /// The code block that covers rendered row `line`, if any.
     pub fn code_block_at(&self, line: usize) -> Option<&CodeRegion> {
         self.code_blocks
@@ -58,6 +160,15 @@ impl RenderedDoc {
             .filter(|link| link.line == line)
             .min_by_key(|link| link.column)
     }
+}
+
+/// Source line of `row` inside `block`.
+fn block_line(block: &BlockMap, row: usize) -> usize {
+    if !block.exact {
+        return block.src_start;
+    }
+    let row = row.clamp(block.content_start, block.content_end.saturating_sub(1));
+    block.src_start + (row - block.content_start)
 }
 
 /// One rendered display line.  All wrapping has already been applied.

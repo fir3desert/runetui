@@ -3,7 +3,10 @@
 use ratatui::style::Style;
 
 use crate::markdown::renderer::wrap_spans;
-use crate::markdown::{RLine, RSpan, RenderedDoc};
+use crate::markdown::{BlockMap, RLine, RSpan, RenderedDoc};
+
+/// Longer documents get no source map (it would cost more than it is worth).
+const MAP_LIMIT: usize = 300_000;
 use crate::ui::themes::Theme;
 
 /// Render a plain `.txt`-style document with soft wrapping.
@@ -21,10 +24,24 @@ pub fn render_plain(lines: &[String], width: usize, theme: Theme) -> RenderedDoc
         );
     }
 
-    for source_line in lines {
+    for (index, source_line) in lines.iter().enumerate() {
+        let start = doc.lines.len();
         let spans = vec![RSpan::styled(source_line.replace('\t', "    "), base)];
         for wrapped in wrap_spans(&spans, width) {
             doc.lines.push(RLine::new(wrapped));
+        }
+        let end = doc.lines.len();
+        if end > start && lines.len() <= MAP_LIMIT {
+            doc.blocks.push(BlockMap {
+                start,
+                end,
+                content_start: start,
+                content_end: end,
+                src_start: index,
+                src_end: index,
+                // A line that wrapped is several rows of one source line.
+                exact: end - start == 1,
+            });
         }
     }
 
